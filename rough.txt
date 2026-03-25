@@ -1,0 +1,6 @@
+•	Typically OEMs implement this on the edge since you want actions (alerts, hazards, horn, seat vibrations, pullover and braking) done fast within the car
+•	When LMT proposes a SF based ML pipeline is this to train the edge or do the entire processing all the time on the cloud?
+•	If so, that is unrealistic as most OEMs are not pushing IR/internal Camera data to the cloud and if they are the throughput for IR/Video data to be sent would be quite expensive.
+•	Most telemetry pipelines to SF or AWS have few seconds delay and not instant as we would want it to be.
+•	Analytics post event can be brought in to SF but that will be just event analytics and not the ML for the logic itself.
+•	The only time this can work is if they are sending sensor output from the car to cloud extremely fast and then we are able to leverage it and push it back to the car equally fast.
