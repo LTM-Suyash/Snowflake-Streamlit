@@ -1,0 +1,532 @@
+Let me read the v4 code thoroughly before writing anything.I have now read the entire codebase thoroughly. Here is the complete meeting guide.
+
+---
+
+# Driver Safety Analytics Platform — Team Lead Meeting Guide
+
+---
+
+## 1. The Big Picture — What the System Does
+
+Before going into any module, set the stage with one clear sentence:
+
+> "We have a video of a driver. Every 200 milliseconds, our system looks at a frame from that video, asks three questions — is the driver drowsy, are their eyes closing, and where are they looking — and combines the answers into a real-time risk score. When that score crosses a threshold and stays there, an alert fires. Everything gets stored in Snowflake for fleet analytics."
+
+That framing makes everything that follows easy to understand.
+
+---
+
+## 2. Frame Sampling — What Happens Before Any Model Runs
+
+We do not process every raw frame from the video. A dashcam typically records at 25–30 frames per second. Running ML inference on every one of those would be extremely slow. Instead we sample at a configurable target FPS, defaulting to 5 frames per second.
+
+```
+VIDEO FPS = 30
+TARGET FPS = 5
+Sampling interval = 30 / 5 = every 6th raw frame
+```
+
+So from a 6-hour video recording 648,000 raw frames, we process approximately 108,000 frames. That is the input to our pipeline.
+
+Each sampled frame goes through this chain before any model sees it:
+
+```
+Raw Frame
+    ↓
+normalize_lighting()      ← fix sunlight / night / overcast
+    ↓
+detect_face_eyes()        ← find face, crop eyes, compute EAR, head pose
+    ↓
+infer_a1()  infer_a2()    ← Module A: fatigue signals
+    ↓
+infer_b()                 ← Module B: gaze zone + off-road
+    ↓
+RollingBuffer             ← accumulate last 60 s of predictions
+    ↓
+temporal analysis         ← PERCLOS, blink rate, smoothing, risk score
+    ↓
+AlertManager              ← decide whether to fire an alert
+```
+
+---
+
+## 3. Pre-processing — Face Detection and EAR
+
+Before any ML model runs, we need to locate the driver's face and eyes precisely. We use MediaPipe FaceMesh which maps 468 landmark points onto the face. From those landmarks we extract:
+
+**Face ROI (Region of Interest)** — the bounding box around all 468 points, used as input to Module A1.
+
+**Eye Strip** — the left and right eye crops individually extracted, concatenated side by side, used as input to Module A2.
+
+**EAR — Eye Aspect Ratio** — a geometry-based measure of how open the eye is, computed directly from 6 landmark points per eye:
+
+```
+        EAR = (||p2 - p6|| + ||p3 - p5||) / (2 × ||p1 - p4||)
+
+Where:
+  p1, p4 = horizontal eye corners (left and right)
+  p2, p3 = upper eyelid points
+  p5, p6 = lower eyelid points
+  || || = Euclidean distance
+```
+
+When the eye is fully open, the vertical distances (p2-p6, p3-p5) are large relative to the horizontal distance, so EAR ≈ 0.30–0.40. When the eye closes, those vertical distances shrink toward zero, so EAR → 0. Our threshold is **EAR ≤ 0.21**, below which we classify the eye as closed.
+
+**Head Pose** — pitch (nodding up/down), yaw (turning left/right), roll (tilting) estimated using OpenCV's solvePnP with 6 known 3D face model points. This feeds into the nod detection signal.
+
+**Why this matters:** The model never sees the full dashcam frame. It only sees a tight crop of the face and the eyes. This makes the model invariant to background changes — the car interior, road, other passengers — and forces it to focus on facial features exclusively.
+
+---
+
+## 4. Module A1 — Drowsiness, Yawn, and Nod Detection
+
+**Architecture:** ResNet18 with a shared backbone and three independent binary output heads.
+
+**Backbone:** ResNet18 is an 18-layer deep convolutional neural network. It is one of the most well-established architectures in computer vision. We use it as a feature extractor — we remove its original classification layer and attach our own three prediction heads instead.
+
+**Input:** 224×224 pixel face crop, RGB, normalised with ImageNet statistics (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]).
+
+**Three output heads, each a single linear layer followed by sigmoid:**
+
+| Output | What it measures | Range |
+|---|---|---|
+| `a1_prob_drowsy` | Overall drowsiness — drooping eyelids, slack face, reduced muscle tone | 0.0 → 1.0 |
+| `a1_prob_yawn` | Mouth open wide — jaw drop pattern associated with fatigue | 0.0 → 1.0 |
+| `a1_prob_nod` | Head nodding forward — the microsleep head-drop pattern | 0.0 → 1.0 |
+
+**Training dataset:** NTHU Drowsy Driver Detection (DDD) dataset — a benchmark dataset specifically collected for driver fatigue research, with labelled drowsy and alert sequences from dashcam-style recordings.
+
+**Confidence score for A1:**
+```
+a1_confidence = mean(|a1_prob_drowsy - 0.5|, |a1_prob_yawn - 0.5|, |a1_prob_nod - 0.5|) × 2
+
+The further each probability is from 0.5 (the decision boundary),
+the more certain the model is. If drowsy=0.95, the model is very 
+sure. If drowsy=0.52, the model is barely above chance.
+```
+
+**Why three heads on one backbone?** The three signals are related — all driven by facial muscle state. A shared backbone learns a rich shared feature representation of the face, and each head specialises in reading a different aspect of that representation. This is more parameter-efficient than three separate models and lets the heads benefit from each other's gradients during training.
+
+---
+
+## 5. Module A2 — Eye Closure (Dedicated Eye Model)
+
+**Architecture:** ResNet18 with a single output head.
+
+**Input:** 64×224 pixel eye strip — both eyes cropped and concatenated horizontally. The aspect ratio is deliberately wide and short because eyes are wider than they are tall.
+
+**Output:** `a2_prob_eye_closed` — probability that the eyes are closed. Range 0.0 → 1.0.
+
+**Why do we have a separate module for eye closure when A1 already predicts drowsy?**
+
+This is an important design decision to explain clearly. A1 looks at the full face and predicts overall drowsiness state — it is influenced by the entire facial expression, including slack muscles, head position, and micro-expressions. A2 looks only at the eyes at high resolution and answers a much simpler, more precise question: are the eyes physically shut right now?
+
+The two signals are complementary:
+- A1 can catch early-stage drowsiness even when the eyes are technically still open (drooping eyelids, glazed expression)
+- A2 gives a precise binary eye-state reading that directly feeds PERCLOS
+- If A1 says drowsy=0.8 but A2 says eye_closed=0.1, the driver looks drowsy but their eyes are still open — this is an early warning
+- If both say high values simultaneously, we have much stronger evidence
+
+**Eye openness score:**
+```
+a2_eye_openness_score = 1 - a2_prob_eye_closed
+```
+This is simply the inverse — a convenient metric for understanding how open the eyes are at a given moment.
+
+---
+
+## 6. Module B — Gaze Zone and Off-Road Detection
+
+**Architecture:** EfficientNet-B0 (specifically `tf_efficientnet_b0.ns_jft_in1k` from the timm library, pre-trained on JFT-300M) with two output heads.
+
+**Input:** Full 224×224 frame (not just the face crop) because gaze zone prediction needs context — the head orientation relative to the full scene.
+
+**Two output heads:**
+
+**Head 1 — Zone classification (8 classes):**
+
+| Zone | Risk Group |
+|---|---|
+| Forward | Safe |
+| Left Mirror | LowRisk |
+| Right Mirror | LowRisk |
+| Rearview | LowRisk |
+| Lap | HighRisk |
+| Radio | HighRisk |
+| Speedometer | HighRisk |
+| Shoulder | HighRisk |
+
+**Training dataset:** LISA Driver Gaze Dataset — a research dataset of drivers with annotated gaze directions across exactly these 8 zones.
+
+**Temperature Scaling:** A critical detail. Raw neural network logits are often overconfident — the model produces probabilities like 0.999 even when it is not actually that certain. We apply temperature scaling with T=2.600605 (calibrated on the LISA validation set) to bring the probabilities to a better-calibrated range:
+
+```
+Calibrated zone probabilities = Softmax(zone_logits / T)
+where T = 2.600605
+```
+
+This means if the raw model said zone=Forward with 0.98 probability, after temperature scaling it might say 0.75 — which better reflects actual accuracy on that class.
+
+**Head 2 — Off-road probability (binary):**
+```
+offroad_prob = sigmoid(offroad_logit)
+```
+A separate binary head trained to detect when the driver's gaze direction is off-road regardless of specific zone. The threshold is 0.35 — if `offroad_prob ≥ 0.35`, the driver is classified as looking off-road.
+
+**Uncertainty and Entropy:**
+```
+Entropy H = -Σ(p_i × log(p_i))   for all 8 zone classes
+
+Normalised entropy = H / log(8)   — scales 0 to 1
+
+Uncertainty = 0.6 × normalised_entropy + 0.4 × (1 - confidence)
+```
+Entropy measures how spread out the zone probabilities are. If the model says Forward=0.9, all others tiny → low entropy → high confidence. If the model says all eight zones are roughly 0.125 → maximum entropy → model has no idea which zone → unreliable prediction, flagged for review.
+
+**Hysteresis on off-road detection:**
+```
+Enter off-road state: offroad_prob ≥ 0.35
+Exit off-road state:  offroad_prob ≤ 0.27   (0.35 - 0.08)
+```
+The entry and exit thresholds are different (this is called hysteresis). Without this, a driver whose gaze probability is hovering around 0.35 would flicker on/off every frame, generating dozens of spurious short events. The hysteresis forces the system to wait for a clear return below 0.27 before declaring the driver is looking forward again.
+
+---
+
+## 7. Key Parameters — Definitions and Significance
+
+### PERCLOS — Percentage of Eye Closure
+
+**Definition:** The fraction of frames in a rolling time window where the eye is classified as closed.
+
+**Formula:**
+```
+PERCLOS(t, W) = (1/W) × Σ eye_closed_binary[i]
+                         for i from (t-W) to t
+
+Where:
+  W   = window size in frames (30-second window at 5fps = 150 frames)
+  eye_closed_binary[i] = 1 if eyes closed at frame i, else 0
+```
+
+**Significance:** PERCLOS is a clinically validated fatigue metric from the US Department of Transportation (FHWA). It is widely used in driver safety research and is considered one of the most reliable objective fatigue indicators. A PERCLOS value above 15% over a 30-second window indicates significant fatigue. Above 25% is considered high danger. In our system we alert at 25%.
+
+**Why it is more reliable than a single-frame eye closure:** A single frame can have a normal blink or a model error. PERCLOS looks at the pattern over 30 seconds — it is statistically robust.
+
+---
+
+### EAR — Eye Aspect Ratio
+
+**Definition:** A geometry-based ratio of the vertical and horizontal distances of eye landmark points.
+
+**Formula:**
+```
+EAR = (||p2 - p6|| + ||p3 - p5||) / (2 × ||p1 - p4||)
+
+Normal open eye:  EAR ≈ 0.30 – 0.40
+Closing eye:      EAR ≈ 0.15 – 0.21
+Closed eye:       EAR < 0.21
+```
+
+**Significance:** EAR is computed from geometry, not from a neural network. This makes it independent of model confidence — it works even when A2's model output is uncertain. We use it as a dual-verification: either A2 says eye_closed OR EAR drops below 0.21, and the eye is classified as closed.
+
+---
+
+### Fatigue Signal Confidence
+
+**Definition:** A composite measure of how much we can trust the fatigue signals for a given frame.
+
+**Formula:**
+```
+preprocess_confidence = 0.6 × quality_score + 0.4 × face_confidence
+
+fatigue_signal_confidence = 0.35 × preprocess_confidence
+                           + 0.35 × a1_confidence
+                           + 0.30 × a2_confidence
+```
+
+**Where:**
+- `quality_score` = blend of frame blur score and brightness score (0–1)
+- `face_confidence` = how well the face was detected (1.0 for MediaPipe, 0.8 for Haar, 0.2 for center-crop)
+- `a1_confidence` = how far A1's outputs are from the decision boundary
+- `a2_confidence` = how far A2's eye_closed output is from 0.5
+
+A frame with `fatigue_signal_confidence < 0.45` is flagged as `uncertain_frame = 1` and its risk contribution is discounted by 30%.
+
+---
+
+### Frame Risk Score
+
+**Definition:** The final per-frame fatigue risk score, ranging 0 to 1.
+
+**Formula:**
+```
+fatigue_score_raw = w_drowsy × drowsy_sm
+                  + w_eye_closed × eye_closed_sm
+                  + w_nod × nod_sm
+                  + w_yawn × yawn_sm
+                  + w_perclos × perclos_30s
+                  + w_blink × normalised_blink_rate
+
+Default weights:
+  w_drowsy    = 0.30
+  w_eye_closed = 0.30
+  w_nod       = 0.15
+  w_yawn      = 0.10
+  w_perclos   = 0.10
+  w_blink     = 0.05
+
+fatigue_score_calibrated = fatigue_score_raw × (0.65 + 0.35 × preprocess_confidence)
+
+frame_risk = fatigue_score_calibrated × 0.70  (if uncertain_frame = 1)
+           = fatigue_score_calibrated          (if uncertain_frame = 0)
+```
+
+**Significance:** The confidence calibration term `(0.65 + 0.35 × preprocess_confidence)` means that even a perfect fatigue signal gets a maximum score of 1.0 when confidence is perfect (1.0), but is discounted to 0.65 minimum when confidence is zero. This prevents the system from issuing high-confidence alerts when the video quality is poor.
+
+**Risk level thresholds (adaptive):**
+```
+alert_threshold   = clip(0.70 + (0.5 - preprocess_confidence) × 0.10, 0.5, 0.9)
+caution_threshold = clip(0.40 + (0.5 - preprocess_confidence) × 0.08, 0.3, 0.8)
+
+→ When confidence is low, thresholds rise automatically,
+  requiring stronger evidence before triggering an alert.
+```
+
+---
+
+### Temporal Smoothing
+
+**Definition:** A rolling mean applied to raw per-frame predictions to remove noise.
+
+**Formula:**
+```
+drowsy_sm[t] = mean(a1_prob_drowsy[t-sw : t])
+              where sw = max(1, floor(0.6 × fps))
+              at fps=5: sw = 3 frames (0.6 seconds of history)
+```
+
+**Significance:** Raw per-frame predictions oscillate because a single frame may be slightly blurred, partially occluded, or hit an edge case. Smoothing suppresses these individual-frame noise spikes and gives a stable signal that reflects the sustained state of the driver.
+
+---
+
+### Blink Rate and Blink Duration
+
+**Definition:** Normal human blink duration is 80–400ms. We detect blinks by finding eye_closed_binary sequences within that duration range.
+
+**Formula:**
+```
+blink_min_frames = max(1, floor(0.08 × fps))   = 1 frame  at fps=5
+blink_max_frames = max(min+1, floor(0.80 × fps)) = 4 frames at fps=5
+
+Any eye_closed sequence of 1–4 frames = blink
+Any eye_closed sequence of ≥5 frames  = prolonged closure (NOT a normal blink)
+
+blink_rate_per_min = (blink count in 30s window) / (30/60)
+```
+
+**Significance:** Normal blink rate is 12–20 per minute. Fatigue reduces blink frequency significantly but increases blink duration. A driver blinking only 4 times per minute with long closure durations is showing a very different pattern than a driver blinking 16 times per minute with sharp, quick blinks.
+
+---
+
+### Combined Driver Safety Score and Rating
+
+**Formula:**
+```
+fatigue_risk_score = 0.45 × avg_drowsy_prob
+                   + 0.25 × PERCLOS
+                   + 0.20 × min(closure_count / 3, 1)
+                   + 0.10 × min(high_risk_duration / 10, 1)
+
+distraction_risk_score = 0.45 × offroad_ratio
+                       + 0.25 × min(offroad_events_per_min / 6, 1)
+                       + 0.20 × (1 - safe_forward_ratio)
+                       + 0.10 × min(repeat_distraction_events / 2, 1)
+
+uncertainty_penalty = 0.08 × max(0, 0.6 - mean_model_confidence)
+
+combined_safety_score = 0.55 × fatigue_risk_score
+                       + 0.45 × distraction_risk_score
+                       + uncertainty_penalty
+
+Rating: A (≤0.20) | B (≤0.40) | C (≤0.60) | D (≤0.80) | E (>0.80)
+```
+
+**Why 55/45 split between fatigue and distraction?** Fatigue gets a slightly higher weight because sustained drowsiness has been shown in road safety research to cause more severe accidents than brief distraction glances. A driver who looks at the radio for 2 seconds is less dangerous on average than a driver with a PERCLOS of 30%.
+
+---
+
+## 8. Temporal Logic — The Full Pipeline Explained
+
+The most important thing to convey is that no single frame makes a decision. Every decision is a function of the recent history of frames.
+
+**Step 1 — Per-frame raw predictions** (every frame, independently)
+```
+Each frame produces:
+  a1_prob_drowsy, a1_prob_yawn, a1_prob_nod  ← from Module A1
+  a2_prob_eye_closed                          ← from Module A2
+  EAR, head_pitch, head_yaw, head_roll        ← from geometry
+  zone_pred, offroad_prob, confidence         ← from Module B
+```
+
+**Step 2 — Temporal smoothing** (rolling window of last ~0.6 seconds)
+```
+drowsy_sm[t]     = mean(drowsy[t-2 : t])
+eye_closed_sm[t] = mean(eye_closed[t-2 : t])
+```
+This removes single-frame noise.
+
+**Step 3 — Eye closed binary** (dual-source decision)
+```
+eye_closed_binary[t] = 1 if (eye_closed_sm[t] ≥ 0.30) OR (EAR[t] ≤ 0.21)
+                      = 0 otherwise
+```
+Either the deep learning model OR the geometry says the eye is closed. This is intentionally inclusive — we want to catch closures that one method might miss.
+
+**Step 4 — PERCLOS computation** (rolling window of last 30 seconds)
+```
+perclos_30s[t] = mean(eye_closed_binary[t-149 : t])
+               at fps=5, 30s window = 150 frames
+```
+
+**Step 5 — Composite fatigue score** (per frame, uses all signals)
+```
+fatigue_score[t] = weighted combination of smoothed signals + PERCLOS
+                  × confidence calibration
+```
+
+**Step 6 — Event detection** (streak detection over complete session)
+```
+prolonged_eye_closure: eye_closed_binary streak ≥ (closure_frames / fps) seconds
+high_fatigue event:    frame_risk ≥ alert_threshold sustained ≥ 2.0 seconds
+offroad_glance event:  offroad_pred = 1 sustained ≥ 2.0 seconds
+```
+
+**Step 7 — Severity scoring per event**
+```
+severity_combined = event_risk_score + min(event_duration / 4.0, 1.0) × 0.25
+
+critical : ≥ 0.90
+high     : ≥ 0.70
+medium   : ≥ 0.45
+low      : < 0.45
+```
+
+Duration contributes up to 0.25 to the severity score. A 10-second eye closure with moderate risk scores higher than a 1-second closure with high risk — because sustained events are more dangerous than brief spikes.
+
+**Step 8 — Escalation logic** (real-time, 5-minute sliding window)
+```
+Count serious alerts (medium/high/critical) in last 5 minutes:
+  ≥ 1  → Level 1 Low
+  ≥ 3  → Level 2 Medium
+  ≥ 5  → Level 3 High
+  ≥ 8  → Level 4 Critical
+
+120 seconds of clean driving → de-escalate by one level
+Alert cooldown: 25 seconds between same-type alerts
+```
+
+---
+
+## 9. Data Flow into Snowflake
+
+Each table captures a different level of granularity:
+
+```
+MODULE_A_FRAME_PREDICTIONS   ← one row per sampled frame (A signals)
+MODULE_B_FRAME_PREDICTIONS   ← one row per sampled frame (B signals)
+UNIFIED_FRAME_PREDICTIONS    ← A and B merged into one row per frame
+MODULE_A_EVENTS              ← one row per detected fatigue event
+MODULE_B_EVENTS              ← one row per detected distraction event
+REALTIME_ALERTS              ← one row per fired alert (with confidence)
+DRIVER_TIMELINE              ← summarised state segments
+DRIVER_SCORECARDS            ← one row per trip (overall scores)
+UNIFIED_DRIVER_SESSION_SUMMARY ← top-level session summary
+```
+
+The key thing to explain here is the granularity hierarchy. You have frame-level data (100,000+ rows per 6-hour trip), event-level data (tens of rows per trip), alert-level data (a handful of rows per trip), and session-level data (one row per trip). This hierarchy is what makes Snowflake analytics powerful — you can drill from "Driver X had a poor week" all the way down to "at frame 47,823 at 5:14:22, the model saw this face crop and predicted drowsy=0.91".
+
+---
+
+## 10. Real-World Business Case — Long-Haul Trucking Fleet
+
+Set this scene for your team lead:
+
+> "Imagine a logistics company with 500 trucks, each driver doing a 10-hour overnight shift. Their main safety problem is drivers falling asleep on the highway between 2am and 4am — this is a known high-risk window from circadian rhythm research."
+
+**Without this system:**
+- A driver starts getting drowsy at 2:40am
+- Nobody knows until an incident happens
+- Average cost of a single commercial truck accident: $148,000 (US FMCSA data)
+- With 500 drivers doing overnight shifts 250 days a year, even a 1% incident rate is 1.25 serious incidents per year
+- That is $185,000 per year in expected incident costs, before insurance, liability, and reputational damage
+
+**With this system:**
+- At 2:43am, driver's PERCLOS crosses 25% — system issues a Low alert
+- At 2:46am, two more alerts in the 5-minute window — escalates to Medium
+- Fleet manager dashboard in Snowflake shows this driver's escalation level going from Normal → Low → Medium in real time
+- Dispatcher calls the driver and routes them to a rest stop
+- Incident avoided
+
+**The analytics value:**
+
+Beyond real-time alerts, the Snowflake data lets the fleet manager answer questions that were previously impossible:
+
+- Which drivers consistently have high PERCLOS between 2–4am? → Reschedule those drivers away from that window
+- Which routes have the highest distraction rates? → High-risk zones (lap, speedometer) frequently seen on certain highway stretches
+- Is driver fatigue getting worse or better over time for a given driver? → Trend analysis using week-over-week safety scores
+- Which drivers are genuinely safe and should be rewarded? → Rating A drivers get recognised
+- When should a driver be required to take a rest break based on their historical pattern? → Predictive scheduling using Snowflake Cortex FORECAST
+
+**The ROI framing:**
+
+If this system prevents just 1 serious accident per year across the fleet, it saves at minimum $148,000. The total cost of the system (development, Snowflake compute, hardware) is a fraction of that. And beyond financial ROI, the liability reduction and improvement in driver wellness are significant non-financial returns.
+
+---
+
+## 11. Additional Things to Tell Your Team Lead
+
+**On model training choices:**
+
+Explain that you chose ResNet18 for Modules A1 and A2 rather than a larger model deliberately. ResNet18 is smaller, faster, and still highly accurate for the face-crop classification task. A ResNet50 or Vision Transformer would have given marginal accuracy gains at the cost of much slower inference — not acceptable for a real-time system. EfficientNet-B0 for Module B was chosen because the LISA gaze dataset is relatively small and EfficientNet's compound scaling makes it more data-efficient than ResNet variants.
+
+**On the simulation fallback:**
+
+If your team lead asks what happens when a model file is missing or fails to load — explain the deterministic simulation fallback. For any frame with index `i` from a video named `source`, the same SHA-256-derived random seed always produces the same simulated output. This means testing is reproducible, and the app never crashes with a blank result even in development or when models are unavailable.
+
+**On the quality-aware threshold system:**
+
+This is something that makes the system more production-ready than a naive approach. Instead of a fixed alert threshold of 0.70 for all frames, the threshold rises automatically when frame quality or model confidence is low:
+
+```
+If preprocess_confidence = 0.40 (poor quality frame):
+  alert_threshold = 0.70 + (0.5 - 0.40) × 0.10 = 0.71
+
+If preprocess_confidence = 0.20 (very poor, e.g. center-crop):
+  alert_threshold = 0.70 + (0.5 - 0.20) × 0.10 = 0.73
+```
+
+This means the system requires stronger evidence before alerting when it is less sure about what it is seeing. A fixed threshold system would either miss alerts on poor-quality frames or generate many false positives.
+
+**On what the driver rating actually means:**
+
+The A–E rating is designed to be meaningful at a glance to a fleet manager who does not understand ML. A driver rated A has a combined safety score below 0.20 — their fatigue signals were low, they spent most of their time looking forward, and their model confidence was high. A driver rated E has a combined score above 0.80 — they showed sustained drowsiness, high PERCLOS, and significant off-road gaze patterns. The rating intentionally mirrors a school grade scale because it is immediately interpretable to any stakeholder.
+
+**On chunk-based processing (v4 key innovation):**
+
+In v3, the entire video was processed first and results shown at the end. In v4, we process 5-second chunks. After each chunk the UI updates, alerts fire if triggered, and data is written to Snowflake incrementally. For a 6-hour video, this means alerts appear as the video is processed rather than 20 minutes after it is uploaded. This is what makes the system operationally useful rather than just analytically interesting.
+
+---
+
+## 12. One-Line Summary for Each Module
+
+If your team lead asks you to summarise each module in one sentence:
+
+> **Module A1:** "ResNet18 trained on NTHU DDD — looks at the face and outputs three probabilities: how drowsy the driver looks, whether they are yawning, and whether their head is nodding."
+
+> **Module A2:** "ResNet18 trained on NTHU DDD — looks only at the eyes and answers one question: are the eyes closed right now, on a scale from 0 to 1."
+
+> **Module B:** "EfficientNet-B0 trained on LISA — looks at the full frame and classifies which of 8 gaze zones the driver is looking at, plus a separate probability for whether they are off-road."
+
+> **The temporal layer:** "Combines the last 30 seconds of per-frame predictions from all three modules into PERCLOS, blink rate, risk score, and events — no single frame makes a decision."
+
+> **Snowflake:** "Every frame row, every event, every alert, and every session summary is stored in structured tables that power the fleet analytics dashboard and enable historical trend analysis."
