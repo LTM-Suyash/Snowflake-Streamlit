@@ -4,3 +4,536 @@
 •	Most telemetry pipelines to SF or AWS have few seconds delay and not instant as we would want it to be.
 •	Analytics post event can be brought in to SF but that will be just event analytics and not the ML for the logic itself.
 •	The only time this can work is if they are sending sensor output from the car to cloud extremely fast and then we are able to leverage it and push it back to the car equally fast.
+
+
+Let me read the relevant parts of the v5 code first.Good — I now have full context of the code. Let me read the `_download_model` function to understand how stage downloads work in your existing setup.Now I have everything I need. Let me write the complete guide and the exact code changes.
+
+---
+
+## Why MediaPipe Fails on Snowflake
+
+When `mediapipe` is imported, it doesn't just load Python code. It needs to find and load bundled `.tflite` model files from its package directory. On Snowflake's restricted Streamlit environment, the package either doesn't install fully, or it installs but can't access its own bundled model files because Snowflake locks down filesystem access for third-party packages. The result is `MP_AVAILABLE = False` and your code falls through to Haar cascade.
+
+Your team lead's solution is correct. The fix is to **stop relying on MediaPipe's bundled models** and instead use ONNX versions of the same underlying models, downloaded from your own Snowflake stage at runtime using `onnxruntime` — which is a standard package that works fine on Snowflake.
+
+---
+
+## The Two Models You Need
+
+MediaPipe FaceMesh internally uses two separate neural networks chained together:
+
+| What it does | MediaPipe internal file | What we replace it with |
+|---|---|---|
+| Detects the face bounding box | `face_detection_short_range.tflite` | **YuNet** — `face_detection_yunet_2023mar.onnx` |
+| Maps 468 landmarks onto the face | `face_landmark.tflite` | `face_landmark.onnx` (converted from MediaPipe's own file) |
+
+---
+
+## Step 1 — Get the Model Files
+
+### Model 1: YuNet Face Detector (easy, direct download)
+
+YuNet is maintained by OpenCV's own team. Download it directly — no conversion needed.
+
+```bash
+# Run this anywhere — your laptop, Kaggle, anywhere with internet
+wget https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+```
+
+Or in Python:
+```python
+import urllib.request
+urllib.request.urlretrieve(
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+    "face_detection_yunet_2023mar.onnx"
+)
+print("YuNet downloaded — size:", os.path.getsize("face_detection_yunet_2023mar.onnx"), "bytes")
+# Expected: ~237 KB
+```
+
+---
+
+### Model 2: Face Landmark ONNX (convert from MediaPipe on Kaggle)
+
+Since you already used MediaPipe on Kaggle for training, the `.tflite` landmark model is already installed there inside the `mediapipe` package. You just need to find it and convert it to ONNX. Run this in a **Kaggle notebook**:
+
+```python
+# ── Step 1: Find MediaPipe's face_landmark.tflite inside the package ──────────
+import mediapipe as mp
+import os
+
+mp_dir = os.path.dirname(mp.__file__)
+tflite_path = None
+
+for root, dirs, files in os.walk(mp_dir):
+    for f in files:
+        if f == "face_landmark.tflite":
+            tflite_path = os.path.join(root, f)
+            print(f"Found: {tflite_path}")
+            break
+    if tflite_path:
+        break
+
+if tflite_path is None:
+    print("Not found — trying alternate name")
+    for root, dirs, files in os.walk(mp_dir):
+        for f in files:
+            if "face_landmark" in f.lower() and f.endswith(".tflite"):
+                tflite_path = os.path.join(root, f)
+                print(f"Found: {tflite_path}")
+                break
+        if tflite_path:
+            break
+
+print(f"Using tflite file: {tflite_path}")
+print(f"File size: {os.path.getsize(tflite_path)} bytes")
+```
+
+```python
+# ── Step 2: Install tf2onnx and convert to ONNX ───────────────────────────────
+!pip install tf2onnx onnx -q
+
+import subprocess
+result = subprocess.run([
+    "python", "-m", "tf2onnx.convert",
+    "--tflite", tflite_path,
+    "--output", "face_landmark.onnx",
+    "--opset", "13"
+], capture_output=True, text=True)
+
+print(result.stdout)
+print(result.stderr)
+
+if os.path.exists("face_landmark.onnx"):
+    print(f"\nSuccess! face_landmark.onnx size: {os.path.getsize('face_landmark.onnx')} bytes")
+else:
+    print("Conversion failed — check the error above")
+```
+
+```python
+# ── Step 3: Verify the ONNX model works ──────────────────────────────────────
+import onnxruntime as ort
+import numpy as np
+
+sess = ort.InferenceSession("face_landmark.onnx", providers=["CPUExecutionProvider"])
+
+print("=== INPUT ===")
+for inp in sess.get_inputs():
+    print(f"  Name: {inp.name}, Shape: {inp.shape}, Type: {inp.type}")
+
+print("=== OUTPUTS ===")
+for out in sess.get_outputs():
+    print(f"  Name: {out.name}, Shape: {out.shape}, Type: {out.type}")
+
+# Run a test inference
+inp_name  = sess.get_inputs()[0].name
+inp_shape = sess.get_inputs()[0].shape
+
+# Build dummy input
+if inp_shape[1] == 3:   # NCHW
+    dummy = np.zeros((1, 3, 192, 192), dtype=np.float32)
+else:                   # NHWC
+    dummy = np.zeros((1, 192, 192, 3), dtype=np.float32)
+
+outputs = sess.run(None, {inp_name: dummy})
+print(f"\nTest inference OK — output shapes: {[o.shape for o in outputs]}")
+# You should see something like: [(1, 1404), (1, 1)] 
+# 1404 = 468 landmarks × 3 coordinates
+```
+
+Now you have both files: `face_detection_yunet_2023mar.onnx` and `face_landmark.onnx`.
+
+---
+
+## Step 2 — Upload Both Files to Your Snowflake Stage
+
+Run this in a Snowflake worksheet or via Snowpark:
+
+```sql
+-- Upload from your local machine using Snowsight UI:
+-- Go to Data → Databases → DEMO_DB → PUBLIC → Stages → DRIVER_SAFETY_MODELS
+-- Click "+ Files" and upload both .onnx files
+
+-- OR via SnowSQL / PUT command:
+PUT file:///path/to/face_detection_yunet_2023mar.onnx @DEMO_DB.PUBLIC.DRIVER_SAFETY_MODELS AUTO_COMPRESS=FALSE;
+PUT file:///path/to/face_landmark.onnx @DEMO_DB.PUBLIC.DRIVER_SAFETY_MODELS AUTO_COMPRESS=FALSE;
+
+-- Verify they are there:
+LIST @DEMO_DB.PUBLIC.DRIVER_SAFETY_MODELS;
+```
+
+You should see all five files listed: `a1_fold1.pt`, `a2_fold1.pt`, `best_lisa_fold5_calibrated.pt`, `face_detection_yunet_2023mar.onnx`, `face_landmark.onnx`.
+
+---
+
+## Step 3 — Code Changes in streamlit_app_v5.py
+
+These are the exact sections to modify. Everything else in the file stays the same.
+
+### Change 1 — Add `onnxruntime` import (after your existing optional deps block)
+
+```python
+# Add this alongside the other try/except import blocks at the top (around line 99)
+try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+```
+
+### Change 2 — Add ONNX model filename constants (after your existing constants block)
+
+```python
+# Add these alongside MODEL_VER_A1, MODEL_VER_A2, MODEL_VER_B constants
+YUNET_MODEL_FILE    = "face_detection_yunet_2023mar.onnx"
+LANDMARK_MODEL_FILE = "face_landmark.onnx"
+LANDMARK_INPUT_SIZE = 192   # face landmark model always expects 192×192
+```
+
+### Change 3 — Replace the entire FACE + EYE DETECTION section
+
+This is the main change. Replace everything from `get_face_mesh()` through the end of `detect_face_eyes()` with the following:
+
+```python
+# =============================================================================
+# FACE + EYE DETECTION  —  ONNX-based (replaces MediaPipe dependency)
+# =============================================================================
+
+def _brightness_score(gray):
+    if gray is None or gray.size == 0: return 0.0
+    return float(np.clip(1.0 - abs(float(np.mean(gray)) - 128.0) / 128.0, 0.0, 1.0))
+
+def _blur_score(gray):
+    if gray is None or gray.size == 0: return 0.0
+    return float(np.clip(cv2.Laplacian(gray, cv2.CV_64F).var() / 300.0, 0.0, 1.0))
+
+def _safe_crop(img, x1, y1, x2, y2):
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 or y2 <= y1: return None
+    return img[y1:y2, x1:x2]
+
+def _lm_xy(lm, idx, w, h):
+    p = lm[idx]
+    return np.array([p.x * w, p.y * h], dtype=np.float32)
+
+def _ear(pts):
+    p1, p2, p3, p4, p5, p6 = pts
+    return float((np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5))
+                 / (2.0 * np.linalg.norm(p1 - p4) + 1e-6))
+
+def _crop_pts(frame, pts, pad=0.28):
+    xs, ys = pts[:, 0], pts[:, 1]
+    x1, x2, y1, y2 = xs.min(), xs.max(), ys.min(), ys.max()
+    w, h = x2 - x1, y2 - y1
+    return _safe_crop(frame, x1 - w * pad, y1 - h * pad, x2 + w * pad, y2 + h * pad)
+
+def _head_pose(lm, shape):
+    h, w = shape[:2]
+    ip  = np.array([_lm_xy(lm,1,w,h), _lm_xy(lm,152,w,h), _lm_xy(lm,33,w,h),
+                    _lm_xy(lm,263,w,h), _lm_xy(lm,61,w,h), _lm_xy(lm,291,w,h)], dtype=np.float64)
+    mp3 = np.array([(0,0,0),(0,-63.6,-12.5),(-43.3,32.7,-26.0),
+                    (43.3,32.7,-26.0),(-28.9,-28.9,-24.1),(28.9,-28.9,-24.1)], dtype=np.float64)
+    cm  = np.array([[w, 0, w/2], [0, w, h/2], [0, 0, 1]], dtype=np.float64)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(mp3, ip, cm, np.zeros((4,1)), flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok: return None, None, None
+        rm, _ = cv2.Rodrigues(rvec)
+        _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(np.hstack((rm, tvec)))
+        return float(euler[0]), float(euler[1]), float(euler[2])
+    except Exception:
+        return None, None, None
+
+
+# ── ONNX model loaders (cached — downloaded once per session) ─────────────────
+
+@st.cache_resource
+def _get_yunet_path() -> str | None:
+    """Download YuNet face detector ONNX from stage and return local path."""
+    if not CV2_AVAILABLE: return None
+    path = _download_model(YUNET_MODEL_FILE)
+    if path and os.path.exists(path):
+        return path
+    return None
+
+@st.cache_resource
+def _get_landmark_session():
+    """Download face landmark ONNX from stage and return onnxruntime session."""
+    if not ONNX_AVAILABLE: return None
+    path = _download_model(LANDMARK_MODEL_FILE)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        return sess
+    except Exception as e:
+        st.toast(f"Landmark model load failed: {e}", icon=":material/warning:")
+        return None
+
+
+# ── Landmark inference helper ─────────────────────────────────────────────────
+
+def _run_landmark_onnx(sess, face_crop_bgr: np.ndarray):
+    """
+    Run face landmark ONNX model on a BGR face crop.
+    Returns (468, 3) float32 array with x, y in [0, 192] space,
+    or None if inference fails.
+    """
+    if sess is None or face_crop_bgr is None: return None
+    try:
+        # Resize and normalise to [0, 1]
+        img = cv2.resize(face_crop_bgr, (LANDMARK_INPUT_SIZE, LANDMARK_INPUT_SIZE))
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+        inp_name  = sess.get_inputs()[0].name
+        inp_shape = sess.get_inputs()[0].shape  # either [1,3,192,192] or [1,192,192,3]
+
+        # Build input tensor in the format the model expects
+        if len(inp_shape) == 4 and inp_shape[1] == 3:         # NCHW
+            tensor = np.transpose(img_rgb, (2, 0, 1))[np.newaxis].astype(np.float32)
+        else:                                                   # NHWC
+            tensor = img_rgb[np.newaxis].astype(np.float32)
+
+        outputs = sess.run(None, {inp_name: tensor})
+
+        # Find the output that contains landmark coordinates (1404 values = 468×3)
+        # Different ONNX exports may put landmarks in different output indices
+        landmarks_raw = None
+        for out in outputs:
+            flat = out.flatten()
+            if flat.size >= 1404:
+                landmarks_raw = flat[:1404]
+                break
+
+        if landmarks_raw is None: return None
+
+        lm = landmarks_raw.reshape(468, 3)
+
+        # Some models output coordinates in [0, 1], others in [0, 192]
+        # Detect which one by checking the range of x/y values
+        if lm[:, :2].max() <= 1.5:          # [0, 1] space
+            lm[:, 0] *= LANDMARK_INPUT_SIZE
+            lm[:, 1] *= LANDMARK_INPUT_SIZE
+
+        return lm   # x, y in [0, 192] space
+
+    except Exception:
+        return None
+
+
+# ── Landmark object shim (keeps _head_pose and _ear compatible) ───────────────
+
+class _LandmarkPt:
+    """
+    Shim so that existing _lm_xy(), _head_pose(), and _ear() functions
+    work without any changes — they expect objects with .x and .y
+    attributes normalised to [0, 1].
+    """
+    __slots__ = ("x", "y")
+    def __init__(self, x_norm: float, y_norm: float):
+        self.x = x_norm
+        self.y = y_norm
+
+
+# ── Main face/eye detection (ONNX → Haar → center-crop fallback chain) ────────
+
+def detect_face_eyes(frame_bgr: np.ndarray) -> dict:
+    """
+    Extract face ROI, eye strip, EAR, and head pose from a BGR frame.
+
+    Detection priority:
+      1. YuNet (ONNX) face detection + face_landmark.onnx for 468 landmarks
+         → full EAR, precise eye crops, head pose  (preprocess_method = "onnx")
+      2. Haar cascade fallback (if ONNX models not in stage)
+         → no EAR, coarse eye strip               (preprocess_method = "haar")
+      3. Center-crop last resort
+         → no face detection at all               (preprocess_method = "center_crop")
+    """
+    default = dict(
+        face=None, eye_strip=None, left_eye=None, right_eye=None,
+        face_detected=False, preprocess_method="none",
+        quality_score=0.0, face_confidence=0.0,
+        brightness_score=0.0, blur_score=0.0,
+        ear=None, left_ear=None, right_ear=None,
+        head_pitch=None, head_yaw=None, head_roll=None)
+
+    if not CV2_AVAILABLE: return default
+
+    h, w = frame_bgr.shape[:2]
+    gray       = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    brightness = _brightness_score(gray)
+    blur       = _blur_score(gray)
+    default.update(brightness_score=brightness, blur_score=blur)
+
+    # ── PATH 1: ONNX (YuNet + face_landmark) ──────────────────────────────────
+    yunet_path = _get_yunet_path()
+    lm_sess    = _get_landmark_session()
+
+    if yunet_path is not None:
+        try:
+            # YuNet face detection
+            detector = cv2.FaceDetectorYN.create(
+                yunet_path, "", (w, h),
+                score_threshold=0.60,
+                nms_threshold=0.30,
+                top_k=5000)
+            _, faces = detector.detect(frame_bgr)
+
+            if faces is not None and len(faces) > 0:
+                # YuNet output per face:
+                # [x, y, w, h, right_eye_x, right_eye_y, left_eye_x, left_eye_y,
+                #  nose_x, nose_y, right_mouth_x, right_mouth_y,
+                #  left_mouth_x, left_mouth_y, score]
+                det  = faces[0]
+                fx   = max(0, int(det[0]) - 10)
+                fy   = max(0, int(det[1]) - 10)
+                fw   = min(w - fx, int(det[2]) + 20)
+                fh   = min(h - fy, int(det[3]) + 20)
+                face_crop = frame_bgr[fy:fy + fh, fx:fx + fw]
+
+                if face_crop.size == 0:
+                    raise ValueError("Empty face crop")
+
+                # Run landmark model on the face crop
+                lm_192 = _run_landmark_onnx(lm_sess, face_crop)
+
+                if lm_192 is not None:
+                    # Map landmark coordinates from [0,192] crop space
+                    # back to original frame pixel coordinates
+                    scale_x = fw / LANDMARK_INPUT_SIZE
+                    scale_y = fh / LANDMARK_INPUT_SIZE
+
+                    lm_frame_x = lm_192[:, 0] * scale_x + fx  # (468,)
+                    lm_frame_y = lm_192[:, 1] * scale_y + fy  # (468,)
+
+                    # Build shim objects that _lm_xy() and _head_pose() understand
+                    lm_shim = [_LandmarkPt(lm_frame_x[i] / w, lm_frame_y[i] / h)
+                               for i in range(468)]
+
+                    # Eye landmark point arrays (pixel coords, shape (6,2))
+                    lp = np.array([[lm_frame_x[i], lm_frame_y[i]] for i in MP_LEFT_EYE],  dtype=np.float32)
+                    rp = np.array([[lm_frame_x[i], lm_frame_y[i]] for i in MP_RIGHT_EYE], dtype=np.float32)
+
+                    l_ear = _ear(lp)
+                    r_ear = _ear(rp)
+                    ear   = (l_ear + r_ear) / 2.0
+
+                    le = _crop_pts(frame_bgr, lp, 0.45)
+                    re = _crop_pts(frame_bgr, rp, 0.45)
+
+                    eye_strip = None
+                    if le is not None and re is not None:
+                        mh = max(le.shape[0], re.shape[0])
+                        if le.shape[0] != mh: le = cv2.resize(le, (le.shape[1], mh))
+                        if re.shape[0] != mh: re = cv2.resize(re, (re.shape[1], mh))
+                        eye_strip = cv2.hconcat([le, re])
+                    elif le is not None: eye_strip = le
+                    elif re is not None: eye_strip = re
+
+                    pitch, yaw, roll = _head_pose(lm_shim, frame_bgr.shape)
+
+                    area    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                    quality = float(np.clip(0.40*blur + 0.30*brightness + 0.30*min(area/0.2, 1.0), 0.0, 1.0))
+
+                    return dict(
+                        face=face_crop, eye_strip=eye_strip,
+                        left_eye=le, right_eye=re,
+                        face_detected=True, preprocess_method="onnx",
+                        quality_score=quality,
+                        face_confidence=min(1.0, 0.5 + quality / 2.0),
+                        brightness_score=brightness, blur_score=blur,
+                        ear=float(ear), left_ear=float(l_ear), right_ear=float(r_ear),
+                        head_pitch=pitch, head_yaw=yaw, head_roll=roll)
+
+                else:
+                    # YuNet found a face but landmark model failed —
+                    # return face crop only (partial result, better than Haar)
+                    area    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                    quality = float(np.clip(0.45*blur + 0.30*brightness + 0.25*min(area/0.2, 1.0), 0.0, 1.0))
+                    strip   = face_crop[int(fh*0.15):int(fh*0.45), :]
+                    return dict(
+                        face=face_crop, eye_strip=strip,
+                        left_eye=None, right_eye=None,
+                        face_detected=True, preprocess_method="yunet_only",
+                        quality_score=quality,
+                        face_confidence=min(0.85, 0.40 + quality / 2.0),
+                        brightness_score=brightness, blur_score=blur,
+                        ear=None, left_ear=None, right_ear=None,
+                        head_pitch=None, head_yaw=None, head_roll=None)
+
+        except Exception:
+            pass  # fall through to Haar
+
+    # ── PATH 2: Haar cascade fallback ─────────────────────────────────────────
+    try:
+        cp = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        if os.path.exists(cp):
+            fc    = cv2.CascadeClassifier(cp)
+            faces = fc.detectMultiScale(gray, 1.3, 5)
+            if len(faces) > 0:
+                x, y, fw, fh = faces[0]
+                face  = frame_bgr[y:y + fh, x:x + fw]
+                strip = face[int(fh * 0.15):int(fh * 0.45), :]
+                ar    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                q     = float(np.clip(0.45*blur + 0.30*brightness + 0.25*min(ar/0.2, 1.0), 0.0, 1.0))
+                return dict(
+                    face=face, eye_strip=strip,
+                    left_eye=None, right_eye=None,
+                    face_detected=True, preprocess_method="haar",
+                    quality_score=q, face_confidence=min(0.8, 0.35 + q / 2.0),
+                    brightness_score=brightness, blur_score=blur,
+                    ear=None, left_ear=None, right_ear=None,
+                    head_pitch=None, head_yaw=None, head_roll=None)
+    except Exception:
+        pass
+
+    # ── PATH 3: Center-crop last resort ───────────────────────────────────────
+    cx, cy   = w // 2, h // 2
+    fw, fh   = int(w * 0.5), int(h * 0.6)
+    x1       = max(0, cx - fw // 2)
+    y1       = max(0, cy - fh // 2)
+    face     = frame_bgr[y1:y1 + fh, x1:x1 + fw]
+    strip    = face[int(fh * 0.15):int(fh * 0.45), :]
+    q        = float(np.clip(0.35*blur + 0.35*brightness + 0.15, 0.0, 0.55))
+    return dict(
+        face=face, eye_strip=strip,
+        left_eye=None, right_eye=None,
+        face_detected=False, preprocess_method="center_crop",
+        quality_score=q, face_confidence=0.20,
+        brightness_score=brightness, blur_score=blur,
+        ear=None, left_ear=None, right_ear=None,
+        head_pitch=None, head_yaw=None, head_roll=None)
+```
+
+---
+
+## What Exactly Changed and Why
+
+**`_get_yunet_path()`** — downloads `face_detection_yunet_2023mar.onnx` from your stage using the same `_download_model()` function you already have. Cached with `@st.cache_resource` so it only downloads once per session.
+
+**`_get_landmark_session()`** — downloads `face_landmark.onnx` and loads it into an `onnxruntime.InferenceSession`. Also cached once per session.
+
+**`_run_landmark_onnx()`** — handles both NCHW and NHWC input formats because different ONNX exports of the same model use different layouts. It also handles coordinates being in either `[0,1]` or `[0,192]` range, so it works regardless of which exact ONNX export you produce from Kaggle.
+
+**`_LandmarkPt` shim class** — this is the key compatibility bridge. Your existing `_lm_xy()`, `_head_pose()`, and `_ear()` functions all expect landmark objects with `.x` and `.y` attributes normalised to `[0,1]`. Rather than rewriting those functions, this tiny class wraps the raw numpy coordinates so the rest of the code works unchanged.
+
+**Fallback chain** — ONNX → Haar → center-crop. The `preprocess_method` field now says `"onnx"` when the full pipeline works, `"yunet_only"` when face is found but landmarks failed, and `"haar"` or `"center_crop"` as before. You can already see this in your Snowflake table in `MODULE_A_FRAME_PREDICTIONS.PREPROCESS_METHOD` so you'll be able to confirm how many frames are using each path.
+
+---
+
+## Quick Checklist Before Deploying
+
+```
+□ face_detection_yunet_2023mar.onnx  uploaded to @DRIVER_SAFETY_MODELS stage
+□ face_landmark.onnx                 uploaded to @DRIVER_SAFETY_MODELS stage
+□ ONNX_AVAILABLE try/except block    added at top of app
+□ YUNET_MODEL_FILE constant          added
+□ LANDMARK_MODEL_FILE constant       added
+□ LANDMARK_INPUT_SIZE constant       added
+□ get_face_mesh() function           deleted (no longer needed)
+□ detect_face_eyes() section         replaced with new version above
+□ onnxruntime                        added to packages in Snowflake Streamlit settings
+```
+
+For the last point — in Snowflake Streamlit, go to your app settings and add `onnxruntime` to the package list alongside `opencv-python-headless`, `torch`, etc.
