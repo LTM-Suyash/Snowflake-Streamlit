@@ -1,0 +1,45 @@
+Here are the best alternatives to MediaPipe available on the Snowflake Anaconda channel for driver safety use cases:
+
+Available in Snowflake Anaconda:
+Package	Use Case	MediaPipe Equivalent
+opencv	Face/eye detection via Haar cascades & DNN module	Face detection, face mesh (basic)
+dlib	68-point facial landmark detection, head pose estimation	Face landmarks, head pose
+scipy	Eye Aspect Ratio (EAR) calculation for drowsiness	Eye gaze/blink detection
+scikit-learn	Classify driver states from extracted features	Classification
+numpy	Geometric calculations (head angles, gaze vectors)	Math/geometry
+Recommended approach — dlib + opencv:
+This is the closest alternative to MediaPipe for driver safety and gives good results:
+
+dlib → 68 facial landmarks (eyes, nose, mouth, jaw) — used widely in drowsiness detection research
+EAR (Eye Aspect Ratio) from landmarks → drowsiness/blink detection
+Head pose estimation from landmarks + cv2.solvePnP → distraction detection
+MAR (Mouth Aspect Ratio) → yawn detection
+python
+# environment.yml
+name: sf_env
+channels:
+  - snowflake
+dependencies:
+  - opencv
+  - dlib
+  - scipy
+  - numpy
+  - scikit-learn
+python
+# Example: Drowsiness detection with dlib
+import dlib
+import cv2
+import numpy as np
+from scipy.spatial import distance
+
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+def eye_aspect_ratio(eye):
+    A = distance.euclidean(eye[1], eye[5])
+    B = distance.euclidean(eye[2], eye[4])
+    C = distance.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C)
+
+# EAR < 0.25 typically indicates closed eyes / drowsiness
+Note: You'll need to upload the shape_predictor_68_face_landmarks.dat model file to a Snowflake stage and load it from there. The dlib + opencv combo is the industry-standard alternative to MediaPipe for facial landmark-based driver monitoring.
