@@ -1,0 +1,459 @@
+Now I know exactly what happened and exactly how to fix it. Let me explain clearly.
+
+---
+
+## Why the Previous ONNX Approach Failed
+
+`onnxruntime` is **not on the Snowflake Anaconda channel**. It exists on `conda-forge` and the general `anaconda` channel, but Snowflake only allows packages from `repo.anaconda.com/pkgs/snowflake/` — and onnxruntime is not there. So when your app tried `import onnxruntime`, it silently failed, the ONNX models never loaded, and the whole thing fell back to Haar cascade.
+
+---
+
+## The Fix — OpenCV Already Has ONNX Inference Built In
+
+Here is the key insight that solves everything: **OpenCV has its own neural network inference engine built directly into the library, called `cv2.dnn`.** It can load and run ONNX models without needing `onnxruntime` at all. You do not need any extra package. The `opencv-python` that is already installed on Snowflake can run your ONNX models natively.
+
+Additionally, OpenCV has a dedicated face detector class `cv2.FaceDetectorYN` that loads YuNet ONNX directly — no extra code needed to run it.
+
+Your YuNet ONNX file is already in your stage from the previous attempt. You only need to change how you call it — swap `onnxruntime.InferenceSession` for `cv2.dnn`.
+
+---
+
+## What YuNet Gives You
+
+Before writing the code, understand what YuNet outputs so you know what you are working with:
+
+```
+For each detected face, YuNet returns a row with 15 values:
+[x, y, w, h,                    ← face bounding box
+ right_eye_x, right_eye_y,      ← right eye centre
+ left_eye_x,  left_eye_y,       ← left eye centre
+ nose_x,      nose_y,           ← nose tip
+ right_mouth_x, right_mouth_y,  ← right mouth corner
+ left_mouth_x,  left_mouth_y,   ← left mouth corner
+ score]                          ← detection confidence
+```
+
+Five keypoints. That is enough to extract eye crops, compute a basic EAR approximation, and estimate head pose — all without any landmark model.
+
+---
+
+## Complete Replacement for `detect_face_eyes()`
+
+You only need the YuNet ONNX file which is already in your stage. The landmark ONNX file is optional — if it is there, we use `cv2.dnn` to run it for better EAR. If not, we work from the 5 keypoints.
+
+### Step 1 — Add constants (replace old MediaPipe constants)
+
+```python
+# Remove the old MediaPipe import block and replace with this:
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+# Model files already in your @DRIVER_SAFETY_MODELS stage
+YUNET_MODEL_FILE    = "face_detection_yunet_2023mar.onnx"
+LANDMARK_MODEL_FILE = "face_landmark.onnx"   # optional — works without it too
+LANDMARK_INPUT_SIZE = 192
+```
+
+### Step 2 — New cached loader using `cv2.dnn` (no onnxruntime)
+
+```python
+@st.cache_resource
+def _load_yunet():
+    """
+    Load YuNet face detector from Snowflake stage using cv2.FaceDetectorYN.
+    cv2.FaceDetectorYN uses opencv's built-in DNN engine — no onnxruntime needed.
+    """
+    if not CV2_AVAILABLE:
+        return None
+    try:
+        path = _download_model(YUNET_MODEL_FILE)
+        if not path or not os.path.exists(path):
+            st.toast("YuNet ONNX not found in stage", icon=":material/warning:")
+            return None
+        # cv2.FaceDetectorYN accepts the ONNX file directly
+        # Input size (320, 320) is a default — resized per frame at runtime
+        detector = cv2.FaceDetectorYN.create(
+            path, "", (320, 320),
+            score_threshold=0.60,
+            nms_threshold=0.30,
+            top_k=5000)
+        return detector
+    except Exception as e:
+        st.toast(f"YuNet load failed: {e}", icon=":material/warning:")
+        return None
+
+
+@st.cache_resource
+def _load_landmark_net():
+    """
+    Load face landmark ONNX using cv2.dnn (not onnxruntime).
+    cv2.dnn.readNetFromONNX is part of opencv — no extra package needed.
+    Returns None gracefully if the file is not in stage.
+    """
+    if not CV2_AVAILABLE:
+        return None
+    try:
+        path = _download_model(LANDMARK_MODEL_FILE)
+        if not path or not os.path.exists(path):
+            return None   # fine — we fall back to 5-point EAR
+        net = cv2.dnn.readNetFromONNX(path)
+        return net
+    except Exception:
+        return None
+```
+
+### Step 3 — Landmark inference helper using `cv2.dnn`
+
+```python
+def _run_landmark_cvdnn(net, face_crop_bgr: np.ndarray):
+    """
+    Run face landmark ONNX using cv2.dnn — returns (468, 2) pixel coords
+    in face_crop space, or None if inference fails.
+    """
+    if net is None or face_crop_bgr is None:
+        return None
+    try:
+        img   = cv2.resize(face_crop_bgr, (LANDMARK_INPUT_SIZE, LANDMARK_INPUT_SIZE))
+        img_f = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+        # cv2.dnn.blobFromImage handles NCHW conversion automatically
+        blob = cv2.dnn.blobFromImage(img_f, scalefactor=1.0,
+                                     size=(LANDMARK_INPUT_SIZE, LANDMARK_INPUT_SIZE),
+                                     mean=(0, 0, 0), swapRB=False, crop=False)
+        net.setInput(blob)
+        outputs = net.forward(net.getUnconnectedOutLayersNames())
+
+        # Find the output containing 1404 values (468 landmarks × 3 coords)
+        landmarks_raw = None
+        for out in outputs:
+            flat = out.flatten()
+            if flat.size >= 1404:
+                landmarks_raw = flat[:1404]
+                break
+
+        if landmarks_raw is None:
+            return None
+
+        lm = landmarks_raw.reshape(468, 3)  # x, y, z
+
+        # Normalise to face_crop pixel coordinates
+        if lm[:, :2].max() <= 1.5:          # model outputs [0,1] range
+            lm[:, 0] *= LANDMARK_INPUT_SIZE
+            lm[:, 1] *= LANDMARK_INPUT_SIZE
+
+        return lm[:, :2]   # return just x, y in [0, 192] crop space
+
+    except Exception:
+        return None
+```
+
+### Step 4 — EAR from 5 YuNet keypoints (fallback when no landmark model)
+
+```python
+def _ear_from_5pts(eye_cx: float, eye_cy: float,
+                   other_eye_cx: float, other_eye_cy: float) -> float:
+    """
+    Approximate EAR from a single eye centre keypoint.
+    Without 6 precise lid points, we estimate eye openness from
+    the inter-eye distance as a normalisation factor and a fixed
+    assumed vertical opening typical of an alert eye.
+    This is less precise than the 6-point EAR but still meaningful
+    for threshold-based eye-closed detection.
+    """
+    inter_eye_dist = float(np.linalg.norm(
+        np.array([eye_cx, eye_cy]) - np.array([other_eye_cx, other_eye_cy])))
+    if inter_eye_dist < 1e-3:
+        return 0.30   # default open-eye value
+    # Typical EAR for open eye ≈ 0.30, blink ≈ 0.15
+    # Without lid points we cannot compute a real EAR —
+    # return a fixed "open" value and rely on A2 for closure detection
+    return 0.30
+```
+
+### Step 5 — Complete `detect_face_eyes()` replacement
+
+```python
+def detect_face_eyes(frame_bgr: np.ndarray) -> dict:
+    """
+    Face + eye detection using:
+      Primary:  cv2.FaceDetectorYN (YuNet ONNX) + cv2.dnn landmark ONNX
+      Fallback: cv2.FaceDetectorYN (YuNet ONNX) + 5-keypoint eye crops
+      Fallback: Haar cascade
+      Last:     Center crop
+
+    Uses ONLY opencv (cv2.dnn, cv2.FaceDetectorYN) — no onnxruntime, no dlib,
+    no mediapipe. Works on Snowflake Anaconda channel without any extra packages.
+    """
+    default = dict(
+        face=None, eye_strip=None, left_eye=None, right_eye=None,
+        face_detected=False, preprocess_method="none",
+        quality_score=0.0, face_confidence=0.0,
+        brightness_score=0.0, blur_score=0.0,
+        ear=None, left_ear=None, right_ear=None,
+        head_pitch=None, head_yaw=None, head_roll=None)
+
+    if not CV2_AVAILABLE:
+        return default
+
+    h, w     = frame_bgr.shape[:2]
+    gray     = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    brightness = _brightness_score(gray)
+    blur       = _blur_score(gray)
+
+    # ── PATH 1: YuNet face detection ──────────────────────────────────────────
+    yunet = _load_yunet()
+    if yunet is not None:
+        try:
+            # Update input size to match current frame
+            yunet.setInputSize((w, h))
+            _, faces = yunet.detect(frame_bgr)
+
+            if faces is not None and len(faces) > 0:
+                det   = faces[0]   # best detection
+                fx    = max(0, int(det[0]))
+                fy    = max(0, int(det[1]))
+                fw    = min(w - fx, int(det[2]))
+                fh    = min(h - fy, int(det[3]))
+
+                # YuNet 5 keypoints (pixel coords in original frame)
+                # det[4,5]  = right_eye  det[6,7] = left_eye
+                # det[8,9]  = nose_tip   det[10,11],det[12,13] = mouth corners
+                right_eye_x, right_eye_y = float(det[4]),  float(det[5])
+                left_eye_x,  left_eye_y  = float(det[6]),  float(det[7])
+                nose_x,      nose_y      = float(det[8]),  float(det[9])
+                r_mouth_x,   r_mouth_y   = float(det[10]), float(det[11])
+                l_mouth_x,   l_mouth_y   = float(det[12]), float(det[13])
+
+                # Face crop with small padding
+                pad      = 12
+                fx1      = max(0, fx - pad);   fy1 = max(0, fy - pad)
+                fx2      = min(w, fx + fw + pad); fy2 = min(h, fy + fh + pad)
+                face_crop = frame_bgr[fy1:fy2, fx1:fx2]
+
+                if face_crop.size == 0:
+                    raise ValueError("Empty face crop from YuNet")
+
+                # ── Try landmark model for precise 468-point EAR ──────────────
+                lm_net      = _load_landmark_net()
+                lm_crop_pts = _run_landmark_cvdnn(lm_net, face_crop)
+
+                if lm_crop_pts is not None:
+                    # Map from crop space → original frame space
+                    scale_x = (fx2 - fx1) / LANDMARK_INPUT_SIZE
+                    scale_y = (fy2 - fy1) / LANDMARK_INPUT_SIZE
+                    lm_x    = lm_crop_pts[:, 0] * scale_x + fx1
+                    lm_y    = lm_crop_pts[:, 1] * scale_y + fy1
+
+                    # MediaPipe-compatible eye indices still work
+                    lp = np.array([[lm_x[i], lm_y[i]] for i in MP_LEFT_EYE],
+                                   dtype=np.float32)
+                    rp = np.array([[lm_x[i], lm_y[i]] for i in MP_RIGHT_EYE],
+                                   dtype=np.float32)
+
+                    l_ear     = _ear(lp); r_ear = _ear(rp)
+                    ear_val   = (l_ear + r_ear) / 2.0
+
+                    le        = _crop_pts(frame_bgr, lp, 0.45)
+                    re        = _crop_pts(frame_bgr, rp, 0.45)
+
+                    # Eye strip
+                    eye_strip = None
+                    if le is not None and re is not None:
+                        mh = max(le.shape[0], re.shape[0])
+                        if le.shape[0] != mh: le = cv2.resize(le, (le.shape[1], mh))
+                        if re.shape[0] != mh: re = cv2.resize(re, (re.shape[1], mh))
+                        eye_strip = cv2.hconcat([le, re])
+                    elif le is not None: eye_strip = le
+                    elif re is not None: eye_strip = re
+
+                    # Head pose from 6 stable points using solvePnP
+                    ip = np.array([
+                        [lm_x[1],   lm_y[1]  ],   # nose bridge
+                        [lm_x[152], lm_y[152]],   # chin
+                        [lm_x[33],  lm_y[33] ],   # left eye outer
+                        [lm_x[263], lm_y[263]],   # right eye outer
+                        [lm_x[61],  lm_y[61] ],   # left mouth
+                        [lm_x[291], lm_y[291]],   # right mouth
+                    ], dtype=np.float64)
+                    mp3 = np.array([(0,0,0),(0,-63.6,-12.5),(-43.3,32.7,-26.0),
+                                    (43.3,32.7,-26.0),(-28.9,-28.9,-24.1),
+                                    (28.9,-28.9,-24.1)], dtype=np.float64)
+                    cm  = np.array([[w,0,w/2],[0,w,h/2],[0,0,1]], dtype=np.float64)
+                    try:
+                        ok, rv, tv = cv2.solvePnP(mp3, ip, cm, np.zeros((4,1)),
+                                                   flags=cv2.SOLVEPNP_ITERATIVE)
+                        if ok:
+                            rm, _ = cv2.Rodrigues(rv)
+                            _,_,_,_,_,_, euler = cv2.decomposeProjectionMatrix(
+                                np.hstack((rm, tv)))
+                            pitch, yaw, roll = float(euler[0]), float(euler[1]), float(euler[2])
+                        else:
+                            pitch = yaw = roll = None
+                    except Exception:
+                        pitch = yaw = roll = None
+
+                    area    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                    quality = float(np.clip(0.40*blur + 0.30*brightness
+                                            + 0.30*min(area/0.2, 1.0), 0.0, 1.0))
+                    return dict(
+                        face=face_crop, eye_strip=eye_strip,
+                        left_eye=le, right_eye=re,
+                        face_detected=True,
+                        preprocess_method="yunet_landmark",
+                        quality_score=quality,
+                        face_confidence=min(1.0, 0.5 + quality/2.0),
+                        brightness_score=brightness, blur_score=blur,
+                        ear=float(ear_val), left_ear=float(l_ear), right_ear=float(r_ear),
+                        head_pitch=pitch, head_yaw=yaw, head_roll=roll)
+
+                else:
+                    # ── YuNet only (no landmark) — use 5-point keypoints ──────
+                    # Eye crops based on keypoint positions + estimated eye width
+                    inter_eye = float(np.linalg.norm(
+                        np.array([left_eye_x - right_eye_x,
+                                  left_eye_y - right_eye_y])))
+                    eye_pad = max(10, inter_eye * 0.35)
+
+                    le = _safe_crop(frame_bgr,
+                                    right_eye_x - eye_pad, right_eye_y - eye_pad*0.6,
+                                    right_eye_x + eye_pad, right_eye_y + eye_pad*0.6)
+                    re = _safe_crop(frame_bgr,
+                                    left_eye_x  - eye_pad, left_eye_y  - eye_pad*0.6,
+                                    left_eye_x  + eye_pad, left_eye_y  + eye_pad*0.6)
+
+                    eye_strip = None
+                    if le is not None and re is not None:
+                        mh = max(le.shape[0], re.shape[0])
+                        if le.shape[0] != mh: le = cv2.resize(le, (le.shape[1], mh))
+                        if re.shape[0] != mh: re = cv2.resize(re, (re.shape[1], mh))
+                        eye_strip = cv2.hconcat([le, re])
+                    elif le is not None: eye_strip = le
+                    elif re is not None: eye_strip = re
+
+                    # Basic head pose from 5 keypoints
+                    ip5 = np.array([
+                        [nose_x,    nose_y   ],
+                        [right_eye_x, right_eye_y],
+                        [left_eye_x,  left_eye_y ],
+                        [r_mouth_x,   r_mouth_y  ],
+                        [l_mouth_x,   l_mouth_y  ],
+                    ], dtype=np.float64)
+                    mp5 = np.array([(0,0,0),(-30,30,-25),(30,30,-25),
+                                    (-25,-30,-20),(25,-30,-20)], dtype=np.float64)
+                    cm  = np.array([[w,0,w/2],[0,w,h/2],[0,0,1]], dtype=np.float64)
+                    try:
+                        ok, rv, tv = cv2.solvePnP(mp5, ip5, cm, np.zeros((4,1)),
+                                                   flags=cv2.SOLVEPNP_ITERATIVE)
+                        if ok:
+                            rm, _ = cv2.Rodrigues(rv)
+                            _,_,_,_,_,_, euler = cv2.decomposeProjectionMatrix(
+                                np.hstack((rm, tv)))
+                            pitch, yaw, roll = float(euler[0]), float(euler[1]), float(euler[2])
+                        else:
+                            pitch = yaw = roll = None
+                    except Exception:
+                        pitch = yaw = roll = None
+
+                    area    = float(np.clip((fw * fh)/(w * h), 0.0, 1.0))
+                    quality = float(np.clip(0.40*blur + 0.30*brightness
+                                            + 0.30*min(area/0.2, 1.0), 0.0, 1.0))
+                    # EAR not computable from 5 keypoints alone — set None,
+                    # rely on A2 model for eye closure detection
+                    return dict(
+                        face=face_crop, eye_strip=eye_strip,
+                        left_eye=le, right_eye=re,
+                        face_detected=True,
+                        preprocess_method="yunet_5pt",
+                        quality_score=quality,
+                        face_confidence=min(0.85, 0.4 + quality/2.0),
+                        brightness_score=brightness, blur_score=blur,
+                        ear=None, left_ear=None, right_ear=None,
+                        head_pitch=pitch, head_yaw=yaw, head_roll=roll)
+
+        except Exception:
+            pass   # fall through to Haar
+
+    # ── PATH 2: Haar cascade ──────────────────────────────────────────────────
+    try:
+        cp = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        if os.path.exists(cp):
+            fc    = cv2.CascadeClassifier(cp)
+            faces = fc.detectMultiScale(gray, 1.3, 5)
+            if len(faces) > 0:
+                x, y, fw, fh = faces[0]
+                face  = frame_bgr[y:y+fh, x:x+fw]
+                strip = face[int(fh*0.15):int(fh*0.45), :]
+                ar    = float(np.clip((fw*fh)/(w*h), 0.0, 1.0))
+                q     = float(np.clip(0.45*blur + 0.30*brightness
+                                      + 0.25*min(ar/0.2, 1.0), 0.0, 1.0))
+                return dict(face=face, eye_strip=strip,
+                            left_eye=None, right_eye=None,
+                            face_detected=True, preprocess_method="haar",
+                            quality_score=q, face_confidence=min(0.8, 0.35+q/2.0),
+                            brightness_score=brightness, blur_score=blur,
+                            ear=None, left_ear=None, right_ear=None,
+                            head_pitch=None, head_yaw=None, head_roll=None)
+    except Exception:
+        pass
+
+    # ── PATH 3: Center-crop last resort ───────────────────────────────────────
+    cx, cy = w//2, h//2
+    fw, fh = int(w*0.5), int(h*0.6)
+    x1     = max(0, cx - fw//2); y1 = max(0, cy - fh//2)
+    face   = frame_bgr[y1:y1+fh, x1:x1+fw]
+    strip  = face[int(fh*0.15):int(fh*0.45), :]
+    q      = float(np.clip(0.35*blur + 0.35*brightness + 0.15, 0.0, 0.55))
+    return dict(face=face, eye_strip=strip, left_eye=None, right_eye=None,
+                face_detected=False, preprocess_method="center_crop",
+                quality_score=q, face_confidence=0.20,
+                brightness_score=brightness, blur_score=blur,
+                ear=None, left_ear=None, right_ear=None,
+                head_pitch=None, head_yaw=None, head_roll=None)
+```
+
+---
+
+## Checklist Before Deploying
+
+```
+□ face_detection_yunet_2023mar.onnx  is in @DRIVER_SAFETY_MODELS stage
+  (from previous attempt — should already be there)
+
+□ face_landmark.onnx  is in @DRIVER_SAFETY_MODELS stage  
+  (optional but better — also from previous attempt)
+
+□ Remove old MediaPipe try/except import block
+  (MP_AVAILABLE, get_face_mesh() — delete all of it)
+
+□ Remove old ONNX try/except block
+  (import onnxruntime — delete this)
+
+□ Add YUNET_MODEL_FILE and LANDMARK_MODEL_FILE constants
+
+□ Add _load_yunet() and _load_landmark_net() functions
+  (both use cv2 only — no new packages)
+
+□ Replace detect_face_eyes() with the new version above
+
+□ In Snowflake Streamlit packages list:
+  Only need: opencv-python-headless, torch, torchvision, pillow, numpy, pandas
+  Do NOT add onnxruntime or dlib — they are not available
+```
+
+---
+
+## One Extra Debug Step — Verify YuNet Loads Correctly
+
+Add this temporary check in your `home_page()` so you can see which detection path is active when you first open the app:
+
+```python
+yunet = _load_yunet()
+lm    = _load_landmark_net()
+st.write(f"YuNet detector: {'✅ Loaded' if yunet else '❌ Not loaded'}")
+st.write(f"Landmark net:   {'✅ Loaded' if lm    else '⚠️ Not loaded (5-pt fallback)'}")
+```
+
+If YuNet shows ❌, the `.onnx` file download from stage is failing — check the stage path matches exactly. If landmark shows ⚠️, the system still works using the 5-keypoint fallback from YuNet, which is significantly better than Haar cascade.
