@@ -1,0 +1,40 @@
+ Driver Safety Analytics Platform
+Unified fatigue + attentiveness analytics — EfficientNet-B0 ensemble, YuNet face detection, Snowflake-ready outputs.
+
+A1 Ensemble (drowsy/yawn/nod)
+
+Not loaded
+A2 Ensemble (eye closed)
+
+Not loaded
+B Ensemble (gaze zone)
+
+Not loaded
+Face Detector
+
+YuNet ONNX
+OK: PyTorch
+OK: OpenCV
+OK: Pillow
+Snowflake session: Connected
+
+
+
+
+Example path of one of the model:
+'@"DEMO_DB"."PUBLIC"."DRIVER_SAFETY_MODELS"/b_fold_3_best.pt'
+
+environment.yml file:
+name: sf_env
+channels:
+  - snowflake
+dependencies:
+  - streamlit
+  - pytorch
+  - torchvision
+  - opencv
+  - pillow
+  - numpy
+  - pandas
+  - onnxruntime
+  - snowflake-snowpark-python
