@@ -103,6 +103,12 @@ except ImportError:
     MP_AVAILABLE = False
 
 try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+
+try:
     from snowflake.snowpark.context import get_active_session
     _session = get_active_session()
 except Exception:
@@ -119,6 +125,9 @@ APP_VERSION     = "5.0.0"
 MODEL_VER_A1    = "a1_fold1.pt"
 MODEL_VER_A2    = "a2_fold1.pt"
 MODEL_VER_B     = "best_lisa_fold5_calibrated.pt"
+YUNET_MODEL_FILE    = "face_detection_yunet_2023mar.onnx"
+LANDMARK_MODEL_FILE = "face_landmark.onnx"
+LANDMARK_INPUT_SIZE = 192   # face landmark model always expects 192×192
 _MODEL_DIR      = tempfile.mkdtemp()
 
 ZONE_CLASSES = ["Forward","Lap","Left Mirror","Radio","Rearview","Right Mirror","Shoulder","Speedometer"]
@@ -389,113 +398,308 @@ def get_face_mesh():
 
 def _brightness_score(gray):
     if gray is None or gray.size == 0: return 0.0
-    return float(np.clip(1.0-abs(float(np.mean(gray))-128.0)/128.0, 0.0, 1.0))
+    return float(np.clip(1.0 - abs(float(np.mean(gray)) - 128.0) / 128.0, 0.0, 1.0))
 
 def _blur_score(gray):
     if gray is None or gray.size == 0: return 0.0
-    return float(np.clip(cv2.Laplacian(gray, cv2.CV_64F).var()/300.0, 0.0, 1.0))
+    return float(np.clip(cv2.Laplacian(gray, cv2.CV_64F).var() / 300.0, 0.0, 1.0))
 
 def _safe_crop(img, x1, y1, x2, y2):
-    h,w = img.shape[:2]
-    x1,y1 = max(0,int(x1)), max(0,int(y1))
-    x2,y2 = min(w,int(x2)), min(h,int(y2))
-    if x2<=x1 or y2<=y1: return None
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 or y2 <= y1: return None
     return img[y1:y2, x1:x2]
 
 def _lm_xy(lm, idx, w, h):
     p = lm[idx]
-    return np.array([p.x*w, p.y*h], dtype=np.float32)
+    return np.array([p.x * w, p.y * h], dtype=np.float32)
 
 def _ear(pts):
-    p1,p2,p3,p4,p5,p6 = pts
-    return float((np.linalg.norm(p2-p6)+np.linalg.norm(p3-p5))/(2.0*np.linalg.norm(p1-p4)+1e-6))
+    p1, p2, p3, p4, p5, p6 = pts
+    return float((np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5))
+                 / (2.0 * np.linalg.norm(p1 - p4) + 1e-6))
 
 def _crop_pts(frame, pts, pad=0.28):
-    xs,ys = pts[:,0], pts[:,1]
-    x1,x2,y1,y2 = xs.min(),xs.max(),ys.min(),ys.max()
-    w,h = x2-x1, y2-y1
-    return _safe_crop(frame, x1-w*pad, y1-h*pad, x2+w*pad, y2+h*pad)
+    xs, ys = pts[:, 0], pts[:, 1]
+    x1, x2, y1, y2 = xs.min(), xs.max(), ys.min(), ys.max()
+    w, h = x2 - x1, y2 - y1
+    return _safe_crop(frame, x1 - w * pad, y1 - h * pad, x2 + w * pad, y2 + h * pad)
 
 def _head_pose(lm, shape):
-    h,w = shape[:2]
-    ip  = np.array([_lm_xy(lm,1,w,h),_lm_xy(lm,152,w,h),_lm_xy(lm,33,w,h),
-                    _lm_xy(lm,263,w,h),_lm_xy(lm,61,w,h),_lm_xy(lm,291,w,h)],dtype=np.float64)
+    h, w = shape[:2]
+    ip  = np.array([_lm_xy(lm,1,w,h), _lm_xy(lm,152,w,h), _lm_xy(lm,33,w,h),
+                    _lm_xy(lm,263,w,h), _lm_xy(lm,61,w,h), _lm_xy(lm,291,w,h)], dtype=np.float64)
     mp3 = np.array([(0,0,0),(0,-63.6,-12.5),(-43.3,32.7,-26.0),
-                    (43.3,32.7,-26.0),(-28.9,-28.9,-24.1),(28.9,-28.9,-24.1)],dtype=np.float64)
-    cm  = np.array([[w,0,w/2],[0,w,h/2],[0,0,1]],dtype=np.float64)
+                    (43.3,32.7,-26.0),(-28.9,-28.9,-24.1),(28.9,-28.9,-24.1)], dtype=np.float64)
+    cm  = np.array([[w, 0, w/2], [0, w, h/2], [0, 0, 1]], dtype=np.float64)
     try:
-        ok,rvec,tvec = cv2.solvePnP(mp3,ip,cm,np.zeros((4,1)),flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok: return None,None,None
-        rm,_ = cv2.Rodrigues(rvec)
-        _,_,_,_,_,_,euler = cv2.decomposeProjectionMatrix(np.hstack((rm,tvec)))
-        return float(euler[0]),float(euler[1]),float(euler[2])
-    except Exception: return None,None,None
+        ok, rvec, tvec = cv2.solvePnP(mp3, ip, cm, np.zeros((4,1)), flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok: return None, None, None
+        rm, _ = cv2.Rodrigues(rvec)
+        _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(np.hstack((rm, tvec)))
+        return float(euler[0]), float(euler[1]), float(euler[2])
+    except Exception:
+        return None, None, None
+    
 
-def detect_face_eyes(frame_bgr):
-    default = dict(face=None,eye_strip=None,left_eye=None,right_eye=None,
-                   face_detected=False,preprocess_method="none",quality_score=0.0,
-                   face_confidence=0.0,brightness_score=0.0,blur_score=0.0,
-                   ear=None,left_ear=None,right_ear=None,head_pitch=None,head_yaw=None,head_roll=None)
-    if not CV2_AVAILABLE: return default
-    h,w = frame_bgr.shape[:2]
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    brightness = _brightness_score(gray); blur = _blur_score(gray)
-    mesh = get_face_mesh()
-    if MP_AVAILABLE and mesh is not None:
-        try:
-            res = mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            if res.multi_face_landmarks:
-                lm  = res.multi_face_landmarks[0].landmark
-                pts = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)
-                x1,y1 = pts.min(axis=0); x2,y2 = pts.max(axis=0)
-                face = _safe_crop(frame_bgr, x1-12, y1-12, x2+12, y2+12)
-                lp   = np.array([_lm_xy(lm,i,w,h) for i in MP_LEFT_EYE],  dtype=np.float32)
-                rp   = np.array([_lm_xy(lm,i,w,h) for i in MP_RIGHT_EYE], dtype=np.float32)
-                le   = _crop_pts(frame_bgr, lp, 0.45)
-                re   = _crop_pts(frame_bgr, rp, 0.45)
-                eye_strip = None
-                if le is not None and re is not None:
-                    mh = max(le.shape[0], re.shape[0])
-                    if le.shape[0]!=mh: le = cv2.resize(le,(le.shape[1],mh))
-                    if re.shape[0]!=mh: re = cv2.resize(re,(re.shape[1],mh))
-                    eye_strip = cv2.hconcat([le, re])
-                elif le is not None: eye_strip = le
-                elif re is not None: eye_strip = re
-                l_ear = _ear(lp); r_ear = _ear(rp); ear = (l_ear+r_ear)/2.0
-                pitch,yaw,roll = _head_pose(lm, frame_bgr.shape)
-                area  = float(np.clip((x2-x1)*(y2-y1)/(w*h), 0.0, 1.0))
-                quality = float(np.clip(0.40*blur+0.30*brightness+0.30*min(area/0.2,1.0), 0.0, 1.0))
-                return dict(face=face,eye_strip=eye_strip,left_eye=le,right_eye=re,
-                            face_detected=face is not None,preprocess_method="mediapipe",
-                            quality_score=quality,face_confidence=min(1.0,0.5+quality/2.0),
-                            brightness_score=brightness,blur_score=blur,
-                            ear=float(ear),left_ear=float(l_ear),right_ear=float(r_ear),
-                            head_pitch=pitch,head_yaw=yaw,head_roll=roll)
-        except Exception: pass
+# ── ONNX model loaders (cached — downloaded once per session) ─────────────────
+
+@st.cache_resource
+def _get_yunet_path() -> str | None:
+    """Download YuNet face detector ONNX from stage and return local path."""
+    if not CV2_AVAILABLE: return None
+    path = _download_model(YUNET_MODEL_FILE)
+    if path and os.path.exists(path):
+        return path
+    return None
+
+@st.cache_resource
+def _get_landmark_session():
+    """Download face landmark ONNX from stage and return onnxruntime session."""
+    if not ONNX_AVAILABLE: return None
+    path = _download_model(LANDMARK_MODEL_FILE)
+    if not path or not os.path.exists(path):
+        return None
     try:
-        cp = cv2.data.haarcascades+"haarcascade_frontalface_default.xml"
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        return sess
+    except Exception as e:
+        st.toast(f"Landmark model load failed: {e}", icon=":material/warning:")
+        return None
+
+
+# ── Landmark inference helper ─────────────────────────────────────────────────
+
+def _run_landmark_onnx(sess, face_crop_bgr: np.ndarray):
+    """
+    Run face landmark ONNX model on a BGR face crop.
+    Returns (468, 3) float32 array with x, y in [0, 192] space,
+    or None if inference fails.
+    """
+    if sess is None or face_crop_bgr is None: return None
+    try:
+        # Resize and normalise to [0, 1]
+        img = cv2.resize(face_crop_bgr, (LANDMARK_INPUT_SIZE, LANDMARK_INPUT_SIZE))
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+        inp_name  = sess.get_inputs()[0].name
+        inp_shape = sess.get_inputs()[0].shape  # either [1,3,192,192] or [1,192,192,3]
+
+        # Build input tensor in the format the model expects
+        if len(inp_shape) == 4 and inp_shape[1] == 3:         # NCHW
+            tensor = np.transpose(img_rgb, (2, 0, 1))[np.newaxis].astype(np.float32)
+        else:                                                   # NHWC
+            tensor = img_rgb[np.newaxis].astype(np.float32)
+
+        outputs = sess.run(None, {inp_name: tensor})
+
+        # Find the output that contains landmark coordinates (1404 values = 468×3)
+        # Different ONNX exports may put landmarks in different output indices
+        landmarks_raw = None
+        for out in outputs:
+            flat = out.flatten()
+            if flat.size >= 1404:
+                landmarks_raw = flat[:1404]
+                break
+
+        if landmarks_raw is None: return None
+
+        lm = landmarks_raw.reshape(468, 3)
+
+        # Some models output coordinates in [0, 1], others in [0, 192]
+        # Detect which one by checking the range of x/y values
+        if lm[:, :2].max() <= 1.5:          # [0, 1] space
+            lm[:, 0] *= LANDMARK_INPUT_SIZE
+            lm[:, 1] *= LANDMARK_INPUT_SIZE
+
+        return lm   # x, y in [0, 192] space
+
+    except Exception:
+        return None
+
+
+# ── Landmark object shim (keeps _head_pose and _ear compatible) ───────────────
+
+class _LandmarkPt:
+    """
+    Shim so that existing _lm_xy(), _head_pose(), and _ear() functions
+    work without any changes — they expect objects with .x and .y
+    attributes normalised to [0, 1].
+    """
+    __slots__ = ("x", "y")
+    def __init__(self, x_norm: float, y_norm: float):
+        self.x = x_norm
+        self.y = y_norm
+
+# ── Main face/eye detection (ONNX → Haar → center-crop fallback chain) ────────
+
+def detect_face_eyes(frame_bgr: np.ndarray) -> dict:
+    """
+    Extract face ROI, eye strip, EAR, and head pose from a BGR frame.
+
+    Detection priority:
+      1. YuNet (ONNX) face detection + face_landmark.onnx for 468 landmarks
+         → full EAR, precise eye crops, head pose  (preprocess_method = "onnx")
+      2. Haar cascade fallback (if ONNX models not in stage)
+         → no EAR, coarse eye strip               (preprocess_method = "haar")
+      3. Center-crop last resort
+         → no face detection at all               (preprocess_method = "center_crop")
+    """
+    default = dict(
+        face=None, eye_strip=None, left_eye=None, right_eye=None,
+        face_detected=False, preprocess_method="none",
+        quality_score=0.0, face_confidence=0.0,
+        brightness_score=0.0, blur_score=0.0,
+        ear=None, left_ear=None, right_ear=None,
+        head_pitch=None, head_yaw=None, head_roll=None)
+
+    if not CV2_AVAILABLE: return default
+
+    h, w = frame_bgr.shape[:2]
+    gray       = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    brightness = _brightness_score(gray)
+    blur       = _blur_score(gray)
+    default.update(brightness_score=brightness, blur_score=blur)
+
+    # ── PATH 1: ONNX (YuNet + face_landmark) ──────────────────────────────────
+    yunet_path = _get_yunet_path()
+    lm_sess    = _get_landmark_session()
+
+    if yunet_path is not None:
+        try:
+            # YuNet face detection
+            detector = cv2.FaceDetectorYN.create(
+                yunet_path, "", (w, h),
+                score_threshold=0.60,
+                nms_threshold=0.30,
+                top_k=5000)
+            _, faces = detector.detect(frame_bgr)
+
+            if faces is not None and len(faces) > 0:
+                # YuNet output per face:
+                # [x, y, w, h, right_eye_x, right_eye_y, left_eye_x, left_eye_y,
+                #  nose_x, nose_y, right_mouth_x, right_mouth_y,
+                #  left_mouth_x, left_mouth_y, score]
+                det  = faces[0]
+                fx   = max(0, int(det[0]) - 10)
+                fy   = max(0, int(det[1]) - 10)
+                fw   = min(w - fx, int(det[2]) + 20)
+                fh   = min(h - fy, int(det[3]) + 20)
+                face_crop = frame_bgr[fy:fy + fh, fx:fx + fw]
+
+                if face_crop.size == 0:
+                    raise ValueError("Empty face crop")
+
+                # Run landmark model on the face crop
+                lm_192 = _run_landmark_onnx(lm_sess, face_crop)
+
+                if lm_192 is not None:
+                    # Map landmark coordinates from [0,192] crop space
+                    # back to original frame pixel coordinates
+                    scale_x = fw / LANDMARK_INPUT_SIZE
+                    scale_y = fh / LANDMARK_INPUT_SIZE
+
+                    lm_frame_x = lm_192[:, 0] * scale_x + fx  # (468,)
+                    lm_frame_y = lm_192[:, 1] * scale_y + fy  # (468,)
+
+                    # Build shim objects that _lm_xy() and _head_pose() understand
+                    lm_shim = [_LandmarkPt(lm_frame_x[i] / w, lm_frame_y[i] / h)
+                               for i in range(468)]
+
+                    # Eye landmark point arrays (pixel coords, shape (6,2))
+                    lp = np.array([[lm_frame_x[i], lm_frame_y[i]] for i in MP_LEFT_EYE],  dtype=np.float32)
+                    rp = np.array([[lm_frame_x[i], lm_frame_y[i]] for i in MP_RIGHT_EYE], dtype=np.float32)
+
+                    l_ear = _ear(lp)
+                    r_ear = _ear(rp)
+                    ear   = (l_ear + r_ear) / 2.0
+
+                    le = _crop_pts(frame_bgr, lp, 0.45)
+                    re = _crop_pts(frame_bgr, rp, 0.45)
+
+                    eye_strip = None
+                    if le is not None and re is not None:
+                        mh = max(le.shape[0], re.shape[0])
+                        if le.shape[0] != mh: le = cv2.resize(le, (le.shape[1], mh))
+                        if re.shape[0] != mh: re = cv2.resize(re, (re.shape[1], mh))
+                        eye_strip = cv2.hconcat([le, re])
+                    elif le is not None: eye_strip = le
+                    elif re is not None: eye_strip = re
+
+                    pitch, yaw, roll = _head_pose(lm_shim, frame_bgr.shape)
+
+                    area    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                    quality = float(np.clip(0.40*blur + 0.30*brightness + 0.30*min(area/0.2, 1.0), 0.0, 1.0))
+
+                    return dict(
+                        face=face_crop, eye_strip=eye_strip,
+                        left_eye=le, right_eye=re,
+                        face_detected=True, preprocess_method="onnx",
+                        quality_score=quality,
+                        face_confidence=min(1.0, 0.5 + quality / 2.0),
+                        brightness_score=brightness, blur_score=blur,
+                        ear=float(ear), left_ear=float(l_ear), right_ear=float(r_ear),
+                        head_pitch=pitch, head_yaw=yaw, head_roll=roll)
+
+                else:
+                    # YuNet found a face but landmark model failed —
+                    # return face crop only (partial result, better than Haar)
+                    area    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                    quality = float(np.clip(0.45*blur + 0.30*brightness + 0.25*min(area/0.2, 1.0), 0.0, 1.0))
+                    strip   = face_crop[int(fh*0.15):int(fh*0.45), :]
+                    return dict(
+                        face=face_crop, eye_strip=strip,
+                        left_eye=None, right_eye=None,
+                        face_detected=True, preprocess_method="yunet_only",
+                        quality_score=quality,
+                        face_confidence=min(0.85, 0.40 + quality / 2.0),
+                        brightness_score=brightness, blur_score=blur,
+                        ear=None, left_ear=None, right_ear=None,
+                        head_pitch=None, head_yaw=None, head_roll=None)
+
+        except Exception:
+            pass  # fall through to Haar
+
+    # ── PATH 2: Haar cascade fallback ─────────────────────────────────────────
+    try:
+        cp = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         if os.path.exists(cp):
-            fc = cv2.CascadeClassifier(cp); faces = fc.detectMultiScale(gray, 1.3, 5)
-            if len(faces)>0:
-                x,y,fw,fh = faces[0]; face = frame_bgr[y:y+fh, x:x+fw]
-                strip = face[int(fh*0.15):int(fh*0.45), :]
-                ar  = float(np.clip((fw*fh)/(w*h), 0.0, 1.0))
-                q   = float(np.clip(0.45*blur+0.30*brightness+0.25*min(ar/0.2,1.0), 0.0, 1.0))
-                return dict(face=face,eye_strip=strip,left_eye=None,right_eye=None,
-                            face_detected=True,preprocess_method="haar",
-                            quality_score=q,face_confidence=min(0.8,0.35+q/2.0),
-                            brightness_score=brightness,blur_score=blur,
-                            ear=None,left_ear=None,right_ear=None,head_pitch=None,head_yaw=None,head_roll=None)
-    except Exception: pass
-    cx,cy = w//2, h//2; fw,fh = int(w*0.5),int(h*0.6)
-    x1 = max(0,cx-fw//2); y1 = max(0,cy-fh//2)
-    face  = frame_bgr[y1:y1+fh, x1:x1+fw]
-    strip = face[int(fh*0.15):int(fh*0.45), :]
-    q = float(np.clip(0.35*blur+0.35*brightness+0.15, 0.0, 0.55))
-    return dict(face=face,eye_strip=strip,left_eye=None,right_eye=None,face_detected=False,
-                preprocess_method="center_crop",quality_score=q,face_confidence=0.20,
-                brightness_score=brightness,blur_score=blur,
-                ear=None,left_ear=None,right_ear=None,head_pitch=None,head_yaw=None,head_roll=None)
+            fc    = cv2.CascadeClassifier(cp)
+            faces = fc.detectMultiScale(gray, 1.3, 5)
+            if len(faces) > 0:
+                x, y, fw, fh = faces[0]
+                face  = frame_bgr[y:y + fh, x:x + fw]
+                strip = face[int(fh * 0.15):int(fh * 0.45), :]
+                ar    = float(np.clip((fw * fh) / (w * h), 0.0, 1.0))
+                q     = float(np.clip(0.45*blur + 0.30*brightness + 0.25*min(ar/0.2, 1.0), 0.0, 1.0))
+                return dict(
+                    face=face, eye_strip=strip,
+                    left_eye=None, right_eye=None,
+                    face_detected=True, preprocess_method="haar",
+                    quality_score=q, face_confidence=min(0.8, 0.35 + q / 2.0),
+                    brightness_score=brightness, blur_score=blur,
+                    ear=None, left_ear=None, right_ear=None,
+                    head_pitch=None, head_yaw=None, head_roll=None)
+    except Exception:
+        pass
+
+    # ── PATH 3: Center-crop last resort ───────────────────────────────────────
+    cx, cy   = w // 2, h // 2
+    fw, fh   = int(w * 0.5), int(h * 0.6)
+    x1       = max(0, cx - fw // 2)
+    y1       = max(0, cy - fh // 2)
+    face     = frame_bgr[y1:y1 + fh, x1:x1 + fw]
+    strip    = face[int(fh * 0.15):int(fh * 0.45), :]
+    q        = float(np.clip(0.35*blur + 0.35*brightness + 0.15, 0.0, 0.55))
+    return dict(
+        face=face, eye_strip=strip,
+        left_eye=None, right_eye=None,
+        face_detected=False, preprocess_method="center_crop",
+        quality_score=q, face_confidence=0.20,
+        brightness_score=brightness, blur_score=blur,
+        ear=None, left_ear=None, right_ear=None,
+        head_pitch=None, head_yaw=None, head_roll=None)
 
 # =============================================================================
 # INFERENCE
@@ -1902,115 +2106,115 @@ def home_page():
             st.write(f"{'✅' if ok else '❌'} {pkg}")
         st.caption(f"Snowflake: {'Connected ✅' if get_session() else 'Not connected ⚠️'}")
     st.divider()
-    with st.container(border=True):
-        st.subheader("What's New in v5.0.0")
-        st.markdown("""
-**Real-time UI**
-- Structured dashboard: annotated frame (left) + colour-coded 2×3 metric grid (right) always visible during processing
-- Progress bar now shows ETA, running alerts/hour, and conservative-mode status
-- Lighting badge on every annotated frame — ☀️ Glare, 🌙 Night, 🌫️ Contrast Boost
-- Side-by-side before/after lighting correction panel when a correction activates
-- Pulsing animated CSS alert banner coloured by severity — pulses at 1.2 s rhythm
-- Blink event indicator (👁 / 😑) on HUD and metric grid
+#     with st.container(border=True):
+#         st.subheader("What's New in v5.0.0")
+#         st.markdown("""
+# **Real-time UI**
+# - Structured dashboard: annotated frame (left) + colour-coded 2×3 metric grid (right) always visible during processing
+# - Progress bar now shows ETA, running alerts/hour, and conservative-mode status
+# - Lighting badge on every annotated frame — ☀️ Glare, 🌙 Night, 🌫️ Contrast Boost
+# - Side-by-side before/after lighting correction panel when a correction activates
+# - Pulsing animated CSS alert banner coloured by severity — pulses at 1.2 s rhythm
+# - Blink event indicator (👁 / 😑) on HUD and metric grid
 
-**Alert System**
-- **Sustained signal gate**: signal must be elevated for ≥ 3 s before any alert fires — eliminates single-frame spikes
-- **Consensus check**: ≥ 2 of 3 signals (A1 drowsy, A2 eye-closed, EAR) must agree before drowsiness alert fires
-- **Dynamic confidence floor**: raised to 0.65 when lighting correction is active — avoids false positives under glare
-- **Mirror cadence suppression**: regular brief mirror checks are suppressed as safe driving behaviour
-- **Isolated yawn suppression**: yawns without accompanying eye closure or high drowsy probability do not trigger alerts
-- **Alert fatigue guard**: >15 alerts in 10 min → conservative mode (Critical-level alerts only), announced to user
-- **Graded output**: every alert now includes a plain-language recommendation ("Take a rest break within 15 min")
-- **Consensus signals logged**: which signals agreed is stored in REALTIME_ALERTS for post-hoc audit
-- **Recovery events**: logged to new DRIVER_RECOVERY_EVENTS Snowflake table whenever driver de-escalates
+# **Alert System**
+# - **Sustained signal gate**: signal must be elevated for ≥ 3 s before any alert fires — eliminates single-frame spikes
+# - **Consensus check**: ≥ 2 of 3 signals (A1 drowsy, A2 eye-closed, EAR) must agree before drowsiness alert fires
+# - **Dynamic confidence floor**: raised to 0.65 when lighting correction is active — avoids false positives under glare
+# - **Mirror cadence suppression**: regular brief mirror checks are suppressed as safe driving behaviour
+# - **Isolated yawn suppression**: yawns without accompanying eye closure or high drowsy probability do not trigger alerts
+# - **Alert fatigue guard**: >15 alerts in 10 min → conservative mode (Critical-level alerts only), announced to user
+# - **Graded output**: every alert now includes a plain-language recommendation ("Take a rest break within 15 min")
+# - **Consensus signals logged**: which signals agreed is stored in REALTIME_ALERTS for post-hoc audit
+# - **Recovery events**: logged to new DRIVER_RECOVERY_EVENTS Snowflake table whenever driver de-escalates
 
-**Analytics**
-- New Recovery Events tab: shows how many times driver self-corrected and their peak escalation before recovery
-- Alert Precision Retrospective: compares real-time alerts vs post-hoc confirmed events
-- Lighting Quality Impact Report: per-lighting-method frame count, avg quality score, avg confidence
-- Dedicated consensus_signals and lighting_at_alert columns in all alert exports
-        """)
-    st.divider()
-    st.subheader("📋 Snowflake Schema Changes Required for v5")
-    st.code("""
--- From v4 (run if not already done):
-CREATE TABLE IF NOT EXISTS DEMO_DB.PUBLIC.REALTIME_ALERTS (
-    ALERT_ID VARCHAR(64), SESSION_ID VARCHAR(64), DRIVER_ID VARCHAR(64),
-    TRIP_ID VARCHAR(64), ALERT_TIMESTAMP_SECONDS FLOAT,
-    ALERT_WALL_TIME VARCHAR(64), ALERT_TYPE VARCHAR(64),
-    SEVERITY VARCHAR(16), SEVERITY_SCORE FLOAT, ESCALATION_LEVEL INT,
-    FATIGUE_SCORE FLOAT, OFFROAD_PROB FLOAT, ZONE_AT_ALERT VARCHAR(32),
-    CONFIDENCE FLOAT, MESSAGE VARCHAR(512), RECOMMENDATION VARCHAR(512),
-    CONSENSUS_SIGNALS VARCHAR(128), LIGHTING_AT_ALERT VARCHAR(32),
-    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-);
-ALTER TABLE DEMO_DB.PUBLIC.MODULE_A_FRAME_PREDICTIONS
-    ADD COLUMN IF NOT EXISTS LIGHTING_METHOD VARCHAR(32);
-ALTER TABLE DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
-    ADD COLUMN IF NOT EXISTS MEAN_MODEL_CONFIDENCE FLOAT;
-ALTER TABLE DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
-    ADD COLUMN IF NOT EXISTS TOTAL_REALTIME_ALERTS INT;
+# **Analytics**
+# - New Recovery Events tab: shows how many times driver self-corrected and their peak escalation before recovery
+# - Alert Precision Retrospective: compares real-time alerts vs post-hoc confirmed events
+# - Lighting Quality Impact Report: per-lighting-method frame count, avg quality score, avg confidence
+# - Dedicated consensus_signals and lighting_at_alert columns in all alert exports
+#         """)
+#     st.divider()
+#     st.subheader("📋 Snowflake Schema Changes Required for v5")
+#     st.code("""
+# -- From v4 (run if not already done):
+# CREATE TABLE IF NOT EXISTS DEMO_DB.PUBLIC.REALTIME_ALERTS (
+#     ALERT_ID VARCHAR(64), SESSION_ID VARCHAR(64), DRIVER_ID VARCHAR(64),
+#     TRIP_ID VARCHAR(64), ALERT_TIMESTAMP_SECONDS FLOAT,
+#     ALERT_WALL_TIME VARCHAR(64), ALERT_TYPE VARCHAR(64),
+#     SEVERITY VARCHAR(16), SEVERITY_SCORE FLOAT, ESCALATION_LEVEL INT,
+#     FATIGUE_SCORE FLOAT, OFFROAD_PROB FLOAT, ZONE_AT_ALERT VARCHAR(32),
+#     CONFIDENCE FLOAT, MESSAGE VARCHAR(512), RECOMMENDATION VARCHAR(512),
+#     CONSENSUS_SIGNALS VARCHAR(128), LIGHTING_AT_ALERT VARCHAR(32),
+#     CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+# );
+# ALTER TABLE DEMO_DB.PUBLIC.MODULE_A_FRAME_PREDICTIONS
+#     ADD COLUMN IF NOT EXISTS LIGHTING_METHOD VARCHAR(32);
+# ALTER TABLE DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
+#     ADD COLUMN IF NOT EXISTS MEAN_MODEL_CONFIDENCE FLOAT;
+# ALTER TABLE DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
+#     ADD COLUMN IF NOT EXISTS TOTAL_REALTIME_ALERTS INT;
 
--- New in v5:
-CREATE TABLE IF NOT EXISTS DEMO_DB.PUBLIC.DRIVER_RECOVERY_EVENTS (
-    RECOVERY_ID VARCHAR(64), SESSION_ID VARCHAR(64), DRIVER_ID VARCHAR(64),
-    TRIP_ID VARCHAR(64), RECOVERY_TIMESTAMP_SECONDS FLOAT,
-    PEAK_ESCALATION_BEFORE INT, RECOVERY_DURATION_SECONDS FLOAT,
-    PREVIOUS_STATE VARCHAR(64), ALERT_COUNT_BEFORE INT,
-    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-);
+# -- New in v5:
+# CREATE TABLE IF NOT EXISTS DEMO_DB.PUBLIC.DRIVER_RECOVERY_EVENTS (
+#     RECOVERY_ID VARCHAR(64), SESSION_ID VARCHAR(64), DRIVER_ID VARCHAR(64),
+#     TRIP_ID VARCHAR(64), RECOVERY_TIMESTAMP_SECONDS FLOAT,
+#     PEAK_ESCALATION_BEFORE INT, RECOVERY_DURATION_SECONDS FLOAT,
+#     PREVIOUS_STATE VARCHAR(64), ALERT_COUNT_BEFORE INT,
+#     CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+# );
 
--- Snowflake Dynamic Table (auto-refreshing leaderboard):
-CREATE OR REPLACE DYNAMIC TABLE DEMO_DB.PUBLIC.DRIVER_RISK_LEADERBOARD
-    TARGET_LAG = '1 hour'
-    WAREHOUSE = COMPUTE_WH
-AS
-SELECT DRIVER_ID,
-       AVG(COMBINED_DRIVER_SAFETY_SCORE)  AS AVG_SAFETY_SCORE,
-       COUNT(DISTINCT SESSION_ID)          AS TOTAL_SESSIONS,
-       MAX(ESCALATION_LEVEL)               AS PEAK_ESCALATION,
-       SUM(TOTAL_REALTIME_ALERTS)          AS TOTAL_ALERTS
-FROM DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
-GROUP BY DRIVER_ID;
+# -- Snowflake Dynamic Table (auto-refreshing leaderboard):
+# CREATE OR REPLACE DYNAMIC TABLE DEMO_DB.PUBLIC.DRIVER_RISK_LEADERBOARD
+#     TARGET_LAG = '1 hour'
+#     WAREHOUSE = COMPUTE_WH
+# AS
+# SELECT DRIVER_ID,
+#        AVG(COMBINED_DRIVER_SAFETY_SCORE)  AS AVG_SAFETY_SCORE,
+#        COUNT(DISTINCT SESSION_ID)          AS TOTAL_SESSIONS,
+#        MAX(ESCALATION_LEVEL)               AS PEAK_ESCALATION,
+#        SUM(TOTAL_REALTIME_ALERTS)          AS TOTAL_ALERTS
+# FROM DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
+# GROUP BY DRIVER_ID;
 
--- Snowflake View (weekly trend):
-CREATE OR REPLACE VIEW DEMO_DB.PUBLIC.DRIVER_WEEKLY_TREND AS
-SELECT DRIVER_ID,
-       DATE_TRUNC('week', TO_TIMESTAMP(SESSION_START_TS)) AS WEEK,
-       AVG(COMBINED_DRIVER_SAFETY_SCORE) AS AVG_SCORE,
-       SUM(TOTAL_REALTIME_ALERTS)        AS WEEKLY_ALERTS,
-       COUNT(DISTINCT SESSION_ID)        AS TRIPS
-FROM DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
-GROUP BY 1, 2;
-""", language="sql")
+# -- Snowflake View (weekly trend):
+# CREATE OR REPLACE VIEW DEMO_DB.PUBLIC.DRIVER_WEEKLY_TREND AS
+# SELECT DRIVER_ID,
+#        DATE_TRUNC('week', TO_TIMESTAMP(SESSION_START_TS)) AS WEEK,
+#        AVG(COMBINED_DRIVER_SAFETY_SCORE) AS AVG_SCORE,
+#        SUM(TOTAL_REALTIME_ALERTS)        AS WEEKLY_ALERTS,
+#        COUNT(DISTINCT SESSION_ID)        AS TRIPS
+# FROM DEMO_DB.PUBLIC.UNIFIED_DRIVER_SESSION_SUMMARY
+# GROUP BY 1, 2;
+# """, language="sql")
 
 # =============================================================================
 # REAL-TIME ANALYSIS PAGE
 # =============================================================================
 def unified_page():
-    st.title(":material/security: Unified Driver Safety — Real-time Analysis")
+    st.title(":material/security: Driver Safety — Real-time Analysis")
     with st.sidebar:
         st.subheader("🪪 Driver & Trip")
         driver_id = st.text_input("Driver ID","DRV_001")
         trip_id   = st.text_input("Trip ID","TRIP_001")
         trip_start= st.text_input("Trip Start",datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         trip_end  = st.text_input("Trip End","")
-        st.subheader("⚙️ Sampling")
+        st.subheader("Sampling")
         afps = st.number_input("Target FPS",1,30,DEFAULT_A["fps"])
-        st.subheader("🔥 Fatigue Weights")
+        st.subheader("Fatigue Weights")
         wd=st.slider("Drowsy",0.0,1.0,DEFAULT_A["w_drowsy"],0.05)
         we=st.slider("Eye Closed",0.0,1.0,DEFAULT_A["w_eye_closed"],0.05)
         wn=st.slider("Nod",0.0,1.0,DEFAULT_A["w_nod"],0.05)
         wy=st.slider("Yawn",0.0,1.0,DEFAULT_A["w_yawn"],0.05)
         wp=st.slider("PERCLOS",0.0,1.0,DEFAULT_A["w_perclos"],0.05)
         wb=st.slider("Blink",0.0,1.0,DEFAULT_A["w_blink"],0.05)
-        st.subheader("🎯 Thresholds")
+        st.subheader("Thresholds")
         te =st.slider("Eye closed thr",0.0,1.0,DEFAULT_A["t_eye"],0.05)
         tc =st.slider("Caution thr",0.0,1.0,DEFAULT_A["t_caution"],0.05)
         ta =st.slider("Alert thr",0.0,1.0,DEFAULT_A["t_alert"],0.05)
         pcf=st.number_input("Min closure frames",2,30,DEFAULT_A["closure_frames"])
         ear_c=st.slider("EAR closed",0.10,0.40,DEFAULT_A["ear_closed"],0.01)
-        st.subheader("👁 Attentiveness")
+        st.subheader("Attentiveness")
         sw_b=st.number_input("Smoothing window",1,10,3)
         bort=st.slider("Off-road threshold",0.0,1.0,OFFROAD_THRESHOLD,0.05)
         st.subheader("🚨 Alert Settings (v5)")
@@ -2036,7 +2240,7 @@ def unified_page():
     st.subheader("📹 Uploaded Video")
     st.video(uploaded.getvalue())
 
-    if st.button("🚀 Start Real-time Analysis",type="primary",use_container_width=True):
+    if st.button("Start Real-time Analysis",type="primary",use_container_width=True):
         video_bytes=uploaded.getvalue()
         with st.spinner("Preparing video…"):
             video_path,video_meta=open_video(video_bytes,ext)
