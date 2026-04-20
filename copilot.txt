@@ -1,0 +1,7 @@
+I want the head dropping to work perfectly. For now its not detecting head dropping forward and sideways. But it's detecting head dropping when the driver's head is straight and not dropping in any side. It is mostly because of the a pillar camera angle for right hand side driver. 
+
+  Also there is always a false gaze alert fired for every test video at 00:04 seconds like:
+00:04 🚨 👁 GAZE: Left Mirror @ 00:04
+00:04 🚨 👁 GAZE: Forward @ 00:04
+
+Do some hard coding to remove this alert. As we should not be getting any alerts for first 6 seconds of the video.
