@@ -1,7 +1,52 @@
-I want the head dropping to work perfectly. For now its not detecting head dropping forward and sideways. But it's detecting head dropping when the driver's head is straight and not dropping in any side. It is mostly because of the a pillar camera angle for right hand side driver. 
+No errors now.I just now tested the app with a video, where I gave driver id as DRV_002 and Trip_002, but in history analytics it is only showing data of driver id DRV_001.Also while testing for the video, alerts where fired, but its not displayed under Alert Intelligence. It's showing:
+Powered by REALTIME_ALERTS — full fleet alert log with timestamps, severity, and context.
+No alerts fired yet across all sessions
 
-  Also there is always a false gaze alert fired for every test video at 00:04 seconds like:
-00:04 🚨 👁 GAZE: Left Mirror @ 00:04
-00:04 🚨 👁 GAZE: Forward @ 00:04
 
-Do some hard coding to remove this alert. As we should not be getting any alerts for first 6 seconds of the video.
+SELECT DRIVER_ID, TRIP_ID, ALERT_TYPE, SEVERITY, CREATED_AT_CLIENT
+FROM REALTIME_ALERTS
+WHERE DRIVER_ID = 'DRV_002'
+ORDER BY CREATED_AT_CLIENT DESC
+LIMIT 50;
+
+SELECT DRIVER_ID, TRIP_ID, SESSION_ID, CREATED_AT_CLIENT
+FROM UNIFIED_DRIVER_SESSION_SUMMARY
+WHERE DRIVER_ID = 'DRV_002'
+ORDER BY CREATED_AT_CLIENT DESC
+LIMIT 50;
+
+SELECT *
+FROM DRIVER_RISK_LEADERBOARD
+WHERE DRIVER_ID = 'DRV_002';
+
+REALTIME_ALERTSColumns present in it:ALERT_ID
+SESSION_ID
+DRIVER_ID
+TRIP_ID
+ALERT_TIMESTAMP_SECONDS
+ALERT_WALL_TIME
+ALERT_TYPE
+SEVERITY
+SEVERITY_SCORE
+ESCALATION_LEVEL
+FATIGUE_SCORE
+OFFROAD_PROB
+ZONE_AT_ALERT
+CONFIDENCE
+MESSAGE
+CREATED_AT
+CREATED_AT_CLIENT
+LIGHTING_AT_ALERT
+
+SELECT DRIVER_ID, TRIP_ID, SESSION_ID, ALERT_TYPE, CREATED_AT_CLIENT
+FROM REALTIME_ALERTS
+ORDER BY COALESCE(CREATED_AT_CLIENT, CREATED_AT) DESC
+LIMIT 50;
+
+SELECT DRIVER_ID, TRIP_ID, SESSION_ID
+FROM UNIFIED_DRIVER_SESSION_SUMMARY
+ORDER BY SESSION_ID DESC
+LIMIT 50;
+
+DESC TABLE UNIFIED_DRIVER_SESSION_SUMMARY;
+
